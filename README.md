@@ -14,6 +14,8 @@
 [![Documentation](https://img.shields.io/badge/docs-open-4C8BF5?style=for-the-badge&logo=readthedocs&logoColor=white)](#документация)
 [![License](https://img.shields.io/github/license/Regstar2/tg-ws-proxy-android?style=for-the-badge&label=license)](LICENSE)
 
+[🌐 Страница проекта](https://regstar2.github.io/projects/tg-ws-proxy-android/ru/) · [English website](https://regstar2.github.io/projects/tg-ws-proxy-android/)
+
 [Быстрый старт](#быстрый-старт) ·
 [Документация](#документация) ·
 [Релизы](https://github.com/Regstar2/tg-ws-proxy-android/releases) ·
@@ -32,7 +34,7 @@ TgWsProxy запускает локальный прокси на Android-уст
 ## Статус проекта
 
 **Версия исходников:** `1.10.13` (`versionCode 51`)  
-**Стадия:** release candidate; тег и GitHub Release публикуются только после финального аудита #7
+**Стадия:** стабильный релиз; v1.10.13 опубликован 25 августа 2026 года
 
 | Область | Статус |
 |---|---|

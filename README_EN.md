@@ -14,6 +14,8 @@ A local Telegram proxy for Android with MTProto and SOCKS5 frontends and routing
 [![Documentation](https://img.shields.io/badge/docs-open-4C8BF5?style=for-the-badge&logo=readthedocs&logoColor=white)](#documentation)
 [![License](https://img.shields.io/github/license/Regstar2/tg-ws-proxy-android?style=for-the-badge&label=license)](LICENSE)
 
+[🌐 Project website](https://regstar2.github.io/projects/tg-ws-proxy-android/) · [Русская версия](https://regstar2.github.io/projects/tg-ws-proxy-android/ru/)
+
 [Quick start](#quick-start) ·
 [Documentation](#documentation) ·
 [Releases](https://github.com/Regstar2/tg-ws-proxy-android/releases) ·
@@ -32,7 +34,7 @@ The primary use case in version `1.10.13` is **MTProto Proxy → Cloudflare Prox
 ## Project status
 
 **Source version:** `1.10.13` (`versionCode 51`)  
-**Stage:** release candidate; the tag and GitHub Release are published only after final Issue #7 acceptance
+**Stage:** stable release; v1.10.13 was published on August 25, 2026
 
 | Area | Status |
 |---|---|
