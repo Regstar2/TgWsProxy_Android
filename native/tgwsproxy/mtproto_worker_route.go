@@ -357,7 +357,7 @@ func (c *mtProtoWorkerConnector) Connect(
 			continue
 		}
 
-		stream, err := mtProtoWebSocketConn(ws, workerRelayInit, candidate.Domain)
+		stream, err := mtProtoWorkerWebSocketConn(ws, workerRelayInit, candidate.Domain)
 		if err != nil {
 			ws.Close()
 			lastErr = err
@@ -418,6 +418,20 @@ func (s *mtProtoWebSocketStream) Read(dst []byte) (int, error) {
 }
 
 func (s *mtProtoWebSocketStream) Write(data []byte) (int, error) {
+	if len(data) == 0 {
+		return 0, nil
+	}
+
+	// A nil splitter is intentional for the Worker route. Flowseal forwards
+	// each transformed TCP read directly as one WebSocket message instead of
+	// buffering until an MTProto packet boundary is reconstructed.
+	if s.splitter == nil {
+		if err := s.socket.Send(data); err != nil {
+			return 0, err
+		}
+		return len(data), nil
+	}
+
 	parts := s.splitter.Split(data)
 	if len(parts) == 0 {
 		return len(data), nil
@@ -435,8 +449,10 @@ func (s *mtProtoWebSocketStream) Close() error {
 		return nil
 	}
 	s.closed = true
-	if tail := s.splitter.Flush(); len(tail) > 0 {
-		_ = s.socket.SendBatch(tail)
+	if s.splitter != nil {
+		if tail := s.splitter.Flush(); len(tail) > 0 {
+			_ = s.socket.SendBatch(tail)
+		}
 	}
 	s.socket.Close()
 	return nil
