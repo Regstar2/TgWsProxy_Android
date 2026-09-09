@@ -264,7 +264,11 @@ func (c *mtProtoWorkerConnector) Connect(
 	}
 
 	workerRelayInit := request.RelayInit
-	if effectiveDC != request.DCID || effectiveMedia != request.IsMedia {
+	// A Flowseal media fix changes only the physical Worker destination.
+	// Rewriting relay_init from -DC2 to -DC4 makes Telegram treat the stream
+	// as a different logical DC and causes the media session to close.
+	if !destination.FlowsealMediaFixApplied &&
+		(effectiveDC != request.DCID || effectiveMedia != request.IsMedia) {
 		signedDC := effectiveDC
 		if effectiveMedia {
 			signedDC = -effectiveDC

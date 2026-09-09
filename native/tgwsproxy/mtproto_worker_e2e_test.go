@@ -165,7 +165,7 @@ func TestMtProtoWorkerE2EHarnessNormalBidirectionalLargeAndSequential(t *testing
 	}
 }
 
-func TestMtProtoWorkerE2EHarnessMediaDC4UploadDownload(t *testing.T) {
+func TestMtProtoWorkerE2EHarnessMediaDestinationOverrideUploadDownload(t *testing.T) {
 	withRuntimeSettings(t, func(settings runtimeSettings) runtimeSettings {
 		settings.Mode = modeWorkerOnly
 		settings.Worker.Enabled = true
@@ -190,27 +190,31 @@ func TestMtProtoWorkerE2EHarnessMediaDC4UploadDownload(t *testing.T) {
 		},
 	}
 
+	relayInit := buildTestInitWithSignedDC(t, -2)
 	conn, result := connector.Connect(context.Background(), mtproxyfrontend.OutboundRequest{
 		DCID:      2,
 		IsMedia:   true,
 		Transport: mtproxyfrontend.TransportPaddedIntermediate,
-		RelayInit: buildTestInitWithSignedDC(t, -2),
+		RelayInit: relayInit,
 	})
 	if result.Err != nil {
 		t.Fatalf("connect: %v", result.Err)
 	}
 	defer conn.Close()
 
-	if !containsAll(dialPath, "/apiws?", "dc=4", "dst=149.154.167.220", "media=1", "sid=") {
+	if !containsAll(dialPath, "/apiws?", "dc=2", "dst=149.154.167.220", "media=1", "sid=") {
 		t.Fatalf("path=%s", dialPath)
 	}
 	frames := socket.sentFrames()
 	if len(frames) != 1 {
 		t.Fatalf("frames=%d want=1", len(frames))
 	}
+	if !bytes.Equal(frames[0], relayInit) {
+		t.Fatal("media destination override changed the original relay_init")
+	}
 	dc, media, ok := dcFromInit(frames[0])
-	if !ok || dc != 4 || !media {
-		t.Fatalf("patched relay_init dc=%d media=%t ok=%t", dc, media, ok)
+	if !ok || dc != 2 || !media {
+		t.Fatalf("relay_init dc=%d media=%t ok=%t", dc, media, ok)
 	}
 
 	upload := bytes.Repeat([]byte{0x7a}, 72*1024)

@@ -82,7 +82,7 @@ func TestResolveCfWorkerDestination_ExperimentalForceRequiresExplicitFlag(t *tes
 	}
 }
 
-func TestResolveCfWorkerDestination_ExperimentalForceMediaDC4(t *testing.T) {
+func TestResolveCfWorkerDestination_ExperimentalMediaOverridePreservesLogicalDC(t *testing.T) {
 	plan := ResolveCfWorkerDestination(WorkerDestinationInput{
 		WorkerDomain:  "example.workers.dev",
 		DCID:          2,
@@ -106,7 +106,7 @@ func TestResolveCfWorkerDestination_ExperimentalForceMediaDC4(t *testing.T) {
 	if plan.EffectiveDestinationMode != WorkerDestinationExperimentalForceMediaDC4 {
 		t.Fatalf("effective_destination_mode=%q", plan.EffectiveDestinationMode)
 	}
-	if plan.EffectiveDC != 4 || !plan.EffectiveIsMedia {
+	if plan.EffectiveDC != 2 || !plan.EffectiveIsMedia {
 		t.Fatalf("effective dc/media = %d/%t", plan.EffectiveDC, plan.EffectiveIsMedia)
 	}
 	if plan.WorkerDst != "149.154.167.220" {
@@ -118,7 +118,7 @@ func TestResolveCfWorkerDestination_ExperimentalForceMediaDC4(t *testing.T) {
 	if !strings.Contains(plan.WorkerURL, "media=1") {
 		t.Fatalf("workerURL=%s", plan.WorkerURL)
 	}
-	if !strings.Contains(plan.WorkerURL, "dc=4") {
+	if !strings.Contains(plan.WorkerURL, "dc=2") {
 		t.Fatalf("workerURL=%s", plan.WorkerURL)
 	}
 }

@@ -97,7 +97,7 @@ func TestMtProtoWorkerConnectorUsesFlowsealDCMapDestination(t *testing.T) {
 	}
 }
 
-func TestMtProtoWorkerConnectorAlignsExperimentalMediaDestinationAndRelayInit(t *testing.T) {
+func TestMtProtoWorkerConnectorMediaDestinationOverridePreservesRelayInit(t *testing.T) {
 	withRuntimeSettings(t, func(settings runtimeSettings) runtimeSettings {
 		settings.Worker.Enabled = true
 		settings.Worker.Domain = "example.workers.dev"
@@ -131,17 +131,17 @@ func TestMtProtoWorkerConnectorAlignsExperimentalMediaDestinationAndRelayInit(t 
 	}
 	defer conn.Close()
 
-	if !containsAll(dialPath, "/apiws?", "dc=4", "dst=149.154.167.220", "media=1", "sid=") {
+	if !containsAll(dialPath, "/apiws?", "dc=2", "dst=149.154.167.220", "media=1", "sid=") {
 		t.Fatalf("path=%s", dialPath)
 	}
 	if len(socket.sent) != 1 {
 		t.Fatalf("sent frames=%d", len(socket.sent))
 	}
-	if bytes.Equal(socket.sent[0], relayInit) {
-		t.Fatal("expected relay init route metadata to be patched for effective DC4 media destination")
+	if !bytes.Equal(socket.sent[0], relayInit) {
+		t.Fatal("media destination override must preserve the original DC2 media relay init")
 	}
 	dc, isMedia, ok := dcFromInit(socket.sent[0])
-	if !ok || dc != 4 || !isMedia {
+	if !ok || dc != 2 || !isMedia {
 		t.Fatalf("relay init dc=%d media=%t ok=%t", dc, isMedia, ok)
 	}
 }
