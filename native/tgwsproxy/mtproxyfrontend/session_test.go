@@ -29,8 +29,8 @@ func TestPrepareOutboundRequestExtractsRouteMetadata(t *testing.T) {
 	if err != nil {
 		t.Fatalf("prepareOutboundRequest: %v", err)
 	}
-	if request.DCID != 2 || !request.IsMedia {
-		t.Fatalf("route metadata dc=%d media=%t", request.DCID, request.IsMedia)
+	if request.SignedDC != -2 || request.DCID != 2 || !request.IsMedia {
+		t.Fatalf("route metadata signed_dc=%d dc=%d media=%t", request.SignedDC, request.DCID, request.IsMedia)
 	}
 	if request.Transport != TransportPaddedIntermediate {
 		t.Fatalf("transport=%s", request.Transport)
@@ -60,6 +60,9 @@ func TestOutboundTransformsRoundTrip(t *testing.T) {
 	request, _, err := prepareOutboundRequest(server, testSecret, "", false, false)
 	if err != nil {
 		t.Fatalf("prepareOutboundRequest: %v", err)
+	}
+	if request.SignedDC != 4 || request.DCID != 4 || request.IsMedia {
+		t.Fatalf("route metadata signed_dc=%d dc=%d media=%t", request.SignedDC, request.DCID, request.IsMedia)
 	}
 
 	clientPlain := []byte("client-to-telegram-payload")
@@ -168,8 +171,8 @@ func TestPrepareOutboundRequestMarksHighDcAsTestDc(t *testing.T) {
 	if err != nil {
 		t.Fatalf("prepareOutboundRequest: %v", err)
 	}
-	if request.DCID != 2 || !request.IsTestDC {
-		t.Fatalf("route metadata dc=%d test=%t", request.DCID, request.IsTestDC)
+	if request.SignedDC != 10002 || request.DCID != 2 || !request.IsTestDC {
+		t.Fatalf("route metadata signed_dc=%d dc=%d test=%t", request.SignedDC, request.DCID, request.IsTestDC)
 	}
 
 	relayDecryptor, err := newAESCTR(request.RelayInit[8:40], request.RelayInit[40:56])

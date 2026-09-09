@@ -439,8 +439,8 @@ func (r *Runtime) handleConnection(ctx context.Context, conn net.Conn, config Co
 	if config.FakeTLSDomain != "" {
 		r.noteFakeTLSAccepted()
 	}
-	r.log("MTProto route request remote=%s dc=%d media=%t test_dc=%t transport=%s selected_backend=%s",
-		remote, request.DCID, request.IsMedia, request.IsTestDC, request.Transport, r.connector.Capability().SelectedBackend)
+	r.log("MTProto route request remote=%s signed_dc=%d dc=%d media=%t test_dc=%t transport=%s selected_backend=%s",
+		remote, request.SignedDC, request.DCID, request.IsMedia, request.IsTestDC, request.Transport, r.connector.Capability().SelectedBackend)
 
 	outbound, result := r.connector.Connect(ctx, request)
 	r.updateRouteTruth(result)
