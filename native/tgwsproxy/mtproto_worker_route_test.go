@@ -7,6 +7,7 @@ import (
 	"io"
 	"net"
 	"testing"
+	"time"
 
 	"tg-ws-proxy/mtproxyfrontend"
 	"tg-ws-proxy/tgwsroute"
@@ -192,6 +193,63 @@ func TestMtProtoWorkerConnectorUsesPreconnectedWorkerWhenMtProtoEnabled(t *testi
 	}
 	if stats.workerWsPreconnectHits.Load() == 0 {
 		t.Fatal("expected worker ws preconnect hit")
+	}
+}
+
+func TestMtProtoWorkerConnectorMediaPoolMissUsesFreshDial(t *testing.T) {
+	withPoolSize(t, 1)
+	stats.Reset()
+	withRuntimeSettings(t, func(settings runtimeSettings) runtimeSettings {
+		settings.Worker.Enabled = true
+		settings.Worker.Domain = "example.workers.dev"
+		settings.Worker.Failover = workerFailoverSettings{}
+		settings.Worker.DestinationMode = tgwsroute.WorkerDestinationPreserveOriginalDst
+		settings.MtProtoWorkerPreconnect = true
+		return settings
+	})
+
+	previousPool := workerPool
+	backgroundDialer := &fakeWorkerDialer{}
+	workerPool = newWorkerWsPool(backgroundDialer)
+	t.Cleanup(func() {
+		workerPool.CloseAll()
+		workerPool = previousPool
+	})
+
+	socket := &fakeMtProtoFrameSocket{}
+	foregroundDials := 0
+	var dialPath string
+	connector := &mtProtoWorkerConnector{
+		dial: func(_, path, _ string) (mtProtoFrameSocket, error) {
+			foregroundDials++
+			dialPath = path
+			return socket, nil
+		},
+	}
+
+	conn, result := connector.Connect(context.Background(), mtproxyfrontend.OutboundRequest{
+		DCID:      2,
+		IsMedia:   true,
+		Transport: mtproxyfrontend.TransportAbridged,
+		RelayInit: buildTestInitWithSignedDC(t, -2),
+	})
+	if result.Err != nil {
+		t.Fatalf("connect: %v", result.Err)
+	}
+	defer conn.Close()
+
+	if foregroundDials != 1 {
+		t.Fatalf("foreground dials=%d want=1", foregroundDials)
+	}
+	if !containsAll(dialPath, "/apiws?", "dc=2", "dst=149.154.167.51", "media=1", "sid=") {
+		t.Fatalf("path=%s", dialPath)
+	}
+	if got := stats.workerWsPreconnectMisses.Load(); got != 1 {
+		t.Fatalf("preconnect misses=%d want=1", got)
+	}
+	time.Sleep(30 * time.Millisecond)
+	if got := backgroundDialer.count.Load(); got != 0 {
+		t.Fatalf("session miss started %d duplicate background dial(s)", got)
 	}
 }
 

@@ -48,3 +48,30 @@ func TestWorkerPoolSessionHitSchedulesReplacementRefill(t *testing.T) {
 	}
 	t.Fatalf("replacement refill was not scheduled after hit, dialed=%d idle=%d", dialer.count.Load(), pool.IdleCount())
 }
+
+
+func TestWorkerPoolSessionDoesNotCrossEffectiveMediaOrDestination(t *testing.T) {
+	withWorkerWsPreconnect(t, true)
+	withPoolSize(t, 1)
+	stats.Reset()
+	pool := newWorkerWsPool(&fakeWorkerDialer{})
+	normalKey := testWorkerKey()
+	pooled := newFakeWebSocket()
+	pool.idle[normalKey] = []poolEntry{{ws: pooled, created: pool.now()}}
+
+	mediaKey := normalKey
+	mediaKey.Media = true
+	if got := pool.GetForSession(mediaKey); got != nil {
+		t.Fatal("non-media pooled socket must not be reused for media")
+	}
+
+	otherDst := normalKey
+	otherDst.Dst = "149.154.167.220"
+	if got := pool.GetForSession(otherDst); got != nil {
+		t.Fatal("pooled socket must not be reused for another effective destination")
+	}
+
+	if got := pool.IdleCount(); got != 1 {
+		t.Fatalf("unrelated pooled entry was consumed, idle=%d", got)
+	}
+}

@@ -339,13 +339,25 @@ func (c *mtProtoWorkerConnector) Connect(
 				)
 			}
 		} else {
-			if logInfo != nil && workerWsPreconnectActive() {
+			preconnectEnabled := workerWsPreconnectActive()
+			if logInfo != nil && preconnectEnabled {
 				logInfo.Printf(
 					"MTProto Worker WS preconnect miss dc=%d media=%t worker_host=%s worker_dst=%s attempt=%d",
 					effectiveDC,
 					effectiveMedia,
 					candidate.Domain,
 					target,
+					i+1,
+				)
+			}
+			if logInfo != nil {
+				logInfo.Printf(
+					"MTProto Worker WS fresh dial dc=%d media=%t worker_host=%s worker_dst=%s preconnect_enabled=%t attempt=%d",
+					effectiveDC,
+					effectiveMedia,
+					candidate.Domain,
+					target,
+					preconnectEnabled,
 					i+1,
 				)
 			}

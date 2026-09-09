@@ -6,6 +6,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"tg-ws-proxy/tgwsroute"
 )
 
 type nopConn struct{}
@@ -24,6 +26,16 @@ type dummyAddr string
 func (a dummyAddr) Network() string { return string(a) }
 func (a dummyAddr) String() string  { return string(a) }
 
+type fakeIdleTimeoutError struct{}
+
+func (fakeIdleTimeoutError) Error() string   { return "idle timeout" }
+func (fakeIdleTimeoutError) Timeout() bool   { return true }
+func (fakeIdleTimeoutError) Temporary() bool { return true }
+
+type fakeIdleConn struct{ nopConn }
+
+func (fakeIdleConn) Read(_ []byte) (int, error) { return 0, fakeIdleTimeoutError{} }
+
 type fakeWorkerDialer struct {
 	count atomic.Int64
 	fail  bool
@@ -40,9 +52,10 @@ func (d *fakeWorkerDialer) DialWorker(_ WorkerPoolKey) (*RawWebSocket, error) {
 var errFakeDial = &net.DNSError{Err: "fake dial failed", Name: "worker.test"}
 
 func newFakeWebSocket() *RawWebSocket {
+	conn := fakeIdleConn{}
 	return &RawWebSocket{
-		conn:      nopConn{},
-		bufReader: bufio.NewReader(nopConn{}),
+		conn:      conn,
+		bufReader: bufio.NewReader(conn),
 	}
 }
 
@@ -195,5 +208,47 @@ func TestWorkerPoolDoesNotWarmupWhenWorkerRouteDisabled(t *testing.T) {
 
 	if settings.workerRouteAvailable() {
 		t.Fatal("worker route should be unavailable for strict CF-only mode")
+	}
+}
+
+
+func TestWorkerWebSocketReusableDetectsPeerClose(t *testing.T) {
+	client, server := net.Pipe()
+	defer client.Close()
+	ws := &RawWebSocket{
+		conn:      client,
+		bufReader: bufio.NewReader(client),
+	}
+
+	if !workerWebSocketReusable(ws) {
+		t.Fatal("quiet connected Worker socket should be reusable")
+	}
+	_ = server.Close()
+	if workerWebSocketReusable(ws) {
+		t.Fatal("peer-closed Worker socket must not be reused")
+	}
+}
+
+func TestWorkerWarmupKeysUseEffectiveDestinationAndExcludeMedia(t *testing.T) {
+	withMtProtoWorkerDCMap(t, map[int]string{2: "149.154.167.220"})
+	settings := runtimeSettings{
+		Worker: workerConfig{
+			Enabled:         true,
+			Domain:          "worker.example",
+			DestinationMode: tgwsroute.WorkerDestinationFlowsealDCMap,
+		},
+	}
+	keys := workerWarmupKeys(settings, []string{"worker.example"})
+	foundDC2 := false
+	for _, key := range keys {
+		if key.Media {
+			t.Fatalf("media key must not be warmed up: %+v", key)
+		}
+		if key.DC == 2 && key.Dst == "149.154.167.220" {
+			foundDC2 = true
+		}
+	}
+	if !foundDC2 {
+		t.Fatalf("effective DC2 destination not warmed up: %+v", keys)
 	}
 }

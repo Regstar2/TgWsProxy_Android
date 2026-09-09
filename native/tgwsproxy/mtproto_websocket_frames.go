@@ -184,7 +184,7 @@ func (p *WorkerWsPool) GetForSession(key WorkerPoolKey) *RawWebSocket {
 		p.idle[key] = bucket
 
 		age := now - entry.created
-		if age > p.maxAge || entry.ws.closed.Load() {
+		if age > p.maxAge || !p.reusable(entry.ws) {
 			go entry.ws.Close()
 			continue
 		}
