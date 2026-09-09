@@ -243,11 +243,43 @@ func (c *mtProtoWorkerConnector) Connect(
 		result.Err = fmt.Errorf("MTProto Worker backend is not configured")
 		return nil, result
 	}
-	target := fallbackTarget(request.DCID, "")
-	if target == "" {
+
+	destination := buildMtProtoWorkerDestinationPlan(
+		candidates[0].Domain,
+		request.DCID,
+		request.IsMedia,
+		settings,
+	)
+	target := strings.TrimSpace(destination.WorkerDst)
+	effectiveDC := destination.EffectiveDC
+	effectiveMedia := destination.EffectiveIsMedia
+	if !destination.OK || target == "" || effectiveDC <= 0 {
 		result.Reason = "dc_target_unavailable"
-		result.Err = fmt.Errorf("no Worker target for dc %d", request.DCID)
+		result.Err = fmt.Errorf(
+			"no Worker destination for dc %d: %s",
+			request.DCID,
+			mtProtoStatusField(destination.FailReason),
+		)
 		return nil, result
+	}
+
+	workerRelayInit := request.RelayInit
+	if effectiveDC != request.DCID || effectiveMedia != request.IsMedia {
+		signedDC := effectiveDC
+		if effectiveMedia {
+			signedDC = -effectiveDC
+		}
+		workerRelayInit = patchInitDC(request.RelayInit, signedDC)
+		patchedDC, patchedMedia, ok := dcFromInit(workerRelayInit)
+		if !ok || patchedDC != effectiveDC || patchedMedia != effectiveMedia {
+			result.Reason = "worker_relay_init_destination_mismatch"
+			result.Err = fmt.Errorf(
+				"Worker relay init destination mismatch: dc=%d media=%t",
+				effectiveDC,
+				effectiveMedia,
+			)
+			return nil, result
+		}
 	}
 
 	maxAttempts := settings.Worker.Failover.maxAttemptsFor(len(candidates))
@@ -262,7 +294,7 @@ func (c *mtProtoWorkerConnector) Connect(
 	var lastReason string
 	for i := 0; i < maxAttempts; i++ {
 		candidate := candidates[i]
-		path := buildWorkerWSPath(request.DCID, target, request.IsMedia, sessionID)
+		path := buildWorkerWSPath(effectiveDC, target, effectiveMedia, sessionID)
 		prefix := fmt.Sprintf(
 			"[MTProto] session_id=%s DC%d%s cfworker",
 			sessionID,
@@ -271,22 +303,26 @@ func (c *mtProtoWorkerConnector) Connect(
 		)
 		if logInfo != nil {
 			logInfo.Printf(
-				"MTProto route truth frontend=MTProto selected_backend=%s actual_backend=none fallback_used=false reason=connecting dc=%d media=%t transport=%s worker_host=%s worker_dst=%s attempt=%d",
+				"MTProto route truth frontend=MTProto selected_backend=%s actual_backend=none fallback_used=false reason=connecting dc=%d media=%t effective_dc=%d effective_media=%t transport=%s worker_host=%s worker_dst=%s destination_mode=%s effective_destination_mode=%s attempt=%d",
 				mtProtoWorkerBackend,
 				request.DCID,
 				request.IsMedia,
+				effectiveDC,
+				effectiveMedia,
 				request.Transport,
 				candidate.Domain,
 				target,
+				destination.ConfiguredDestinationMode,
+				destination.EffectiveDestinationMode,
 				i+1,
 			)
 		}
 
 		poolKey := WorkerPoolKey{
-			DC:           request.DCID,
+			DC:           effectiveDC,
 			WorkerDomain: candidate.Domain,
 			Dst:          target,
-			Media:        request.IsMedia,
+			Media:        effectiveMedia,
 		}
 		var ws mtProtoFrameSocket
 		var err error
@@ -295,8 +331,8 @@ func (c *mtProtoWorkerConnector) Connect(
 			if logInfo != nil {
 				logInfo.Printf(
 					"MTProto Worker WS preconnect hit dc=%d media=%t worker_host=%s worker_dst=%s attempt=%d",
-					request.DCID,
-					request.IsMedia,
+					effectiveDC,
+					effectiveMedia,
 					candidate.Domain,
 					target,
 					i+1,
@@ -306,8 +342,8 @@ func (c *mtProtoWorkerConnector) Connect(
 			if logInfo != nil && workerWsPreconnectActive() {
 				logInfo.Printf(
 					"MTProto Worker WS preconnect miss dc=%d media=%t worker_host=%s worker_dst=%s attempt=%d",
-					request.DCID,
-					request.IsMedia,
+					effectiveDC,
+					effectiveMedia,
 					candidate.Domain,
 					target,
 					i+1,
@@ -321,7 +357,7 @@ func (c *mtProtoWorkerConnector) Connect(
 			continue
 		}
 
-		stream, err := mtProtoWebSocketConn(ws, request.RelayInit, candidate.Domain)
+		stream, err := mtProtoWebSocketConn(ws, workerRelayInit, candidate.Domain)
 		if err != nil {
 			ws.Close()
 			lastErr = err

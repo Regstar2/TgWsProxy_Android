@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"tg-ws-proxy/mtproxyfrontend"
+	"tg-ws-proxy/tgwsroute"
 )
 
 func TestMtProtoWorkerConnectorUsesConfiguredWorkerWithoutFallback(t *testing.T) {
@@ -16,6 +17,7 @@ func TestMtProtoWorkerConnectorUsesConfiguredWorkerWithoutFallback(t *testing.T)
 		settings.Worker.Enabled = true
 		settings.Worker.Domain = "example.workers.dev"
 		settings.Worker.Failover = workerFailoverSettings{}
+		settings.Worker.DestinationMode = tgwsroute.WorkerDestinationPreserveOriginalDst
 		return settings
 	})
 
@@ -54,6 +56,92 @@ func TestMtProtoWorkerConnectorUsesConfiguredWorkerWithoutFallback(t *testing.T)
 	}
 	if len(socket.sent) != 1 || !bytes.Equal(socket.sent[0], relayInit) {
 		t.Fatal("relay init was not sent to Worker")
+	}
+}
+
+func TestMtProtoWorkerConnectorUsesFlowsealDCMapDestination(t *testing.T) {
+	withMtProtoWorkerDCMap(t, map[int]string{2: "149.154.167.220"})
+	withRuntimeSettings(t, func(settings runtimeSettings) runtimeSettings {
+		settings.Worker.Enabled = true
+		settings.Worker.Domain = "example.workers.dev"
+		settings.Worker.Failover = workerFailoverSettings{}
+		settings.Worker.DestinationMode = tgwsroute.WorkerDestinationFlowsealDCMap
+		return settings
+	})
+
+	socket := &fakeMtProtoFrameSocket{}
+	var dialPath string
+	connector := &mtProtoWorkerConnector{
+		dial: func(_, path, _ string) (mtProtoFrameSocket, error) {
+			dialPath = path
+			return socket, nil
+		},
+	}
+	relayInit := buildTestInitWithSignedDC(t, 2)
+	conn, result := connector.Connect(context.Background(), mtproxyfrontend.OutboundRequest{
+		DCID:      2,
+		Transport: mtproxyfrontend.TransportAbridged,
+		RelayInit: relayInit,
+	})
+	if result.Err != nil {
+		t.Fatalf("connect: %v", result.Err)
+	}
+	defer conn.Close()
+
+	if !containsAll(dialPath, "/apiws?", "dc=2", "dst=149.154.167.220", "media=0", "sid=") {
+		t.Fatalf("path=%s", dialPath)
+	}
+	if len(socket.sent) != 1 || !bytes.Equal(socket.sent[0], relayInit) {
+		t.Fatal("FLOWSEAL_DC_MAP must keep relay init metadata when effective dc/media are unchanged")
+	}
+}
+
+func TestMtProtoWorkerConnectorAlignsExperimentalMediaDestinationAndRelayInit(t *testing.T) {
+	withRuntimeSettings(t, func(settings runtimeSettings) runtimeSettings {
+		settings.Worker.Enabled = true
+		settings.Worker.Domain = "example.workers.dev"
+		settings.Worker.Failover = workerFailoverSettings{}
+		settings.Worker.DestinationMode = tgwsroute.WorkerDestinationExperimentalForceMediaDC4
+		settings.Worker.MediaFix = flowsealMediaFixConfig{
+			Enabled: true,
+			DC:      4,
+			IP:      "149.154.167.220",
+		}
+		return settings
+	})
+
+	socket := &fakeMtProtoFrameSocket{}
+	var dialPath string
+	connector := &mtProtoWorkerConnector{
+		dial: func(_, path, _ string) (mtProtoFrameSocket, error) {
+			dialPath = path
+			return socket, nil
+		},
+	}
+	relayInit := buildTestInitWithSignedDC(t, -2)
+	conn, result := connector.Connect(context.Background(), mtproxyfrontend.OutboundRequest{
+		DCID:      2,
+		IsMedia:   true,
+		Transport: mtproxyfrontend.TransportAbridged,
+		RelayInit: relayInit,
+	})
+	if result.Err != nil {
+		t.Fatalf("connect: %v", result.Err)
+	}
+	defer conn.Close()
+
+	if !containsAll(dialPath, "/apiws?", "dc=4", "dst=149.154.167.220", "media=1", "sid=") {
+		t.Fatalf("path=%s", dialPath)
+	}
+	if len(socket.sent) != 1 {
+		t.Fatalf("sent frames=%d", len(socket.sent))
+	}
+	if bytes.Equal(socket.sent[0], relayInit) {
+		t.Fatal("expected relay init route metadata to be patched for effective DC4 media destination")
+	}
+	dc, isMedia, ok := dcFromInit(socket.sent[0])
+	if !ok || dc != 4 || !isMedia {
+		t.Fatalf("relay init dc=%d media=%t ok=%t", dc, isMedia, ok)
 	}
 }
 
@@ -369,5 +457,18 @@ func withRuntimeSettings(t *testing.T, mutate func(runtimeSettings) runtimeSetti
 	setRuntimeSettings(mutate(previous))
 	t.Cleanup(func() {
 		setRuntimeSettings(previous)
+	})
+}
+
+func withMtProtoWorkerDCMap(t *testing.T, value map[int]string) {
+	t.Helper()
+	dcOptMu.Lock()
+	previous := dcOpt
+	dcOpt = value
+	dcOptMu.Unlock()
+	t.Cleanup(func() {
+		dcOptMu.Lock()
+		dcOpt = previous
+		dcOptMu.Unlock()
 	})
 }

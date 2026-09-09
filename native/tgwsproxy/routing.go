@@ -357,12 +357,19 @@ func snapshotDcOptMap() map[int]string {
 	return out
 }
 
-func buildCfWorkerDestinationPlanWithMedia(workerDomain string, session *initSession, parsedDstHost string, settings runtimeSettings, isMedia bool) tgwsroute.WorkerDestinationPlan {
+func resolveWorkerDestinationPlan(
+	workerDomain string,
+	dc int,
+	isMedia bool,
+	dcOK bool,
+	parsedDstHost string,
+	settings runtimeSettings,
+) tgwsroute.WorkerDestinationPlan {
 	return tgwsroute.ResolveCfWorkerDestination(tgwsroute.WorkerDestinationInput{
 		WorkerDomain:  workerDomain,
-		DCID:          session.dc,
+		DCID:          dc,
 		IsMedia:       isMedia,
-		DCOk:          session.dcOk,
+		DCOk:          dcOK,
 		ParsedDstHost: parsedDstHost,
 		Mode:          settings.Worker.DestinationMode,
 		DcIPMap:       snapshotDcOptMap(),
@@ -372,6 +379,22 @@ func buildCfWorkerDestinationPlanWithMedia(workerDomain string, session *initSes
 			IP:      settings.Worker.MediaFix.IP,
 		},
 	})
+}
+
+func buildCfWorkerDestinationPlanWithMedia(workerDomain string, session *initSession, parsedDstHost string, settings runtimeSettings, isMedia bool) tgwsroute.WorkerDestinationPlan {
+	return resolveWorkerDestinationPlan(
+		workerDomain,
+		session.dc,
+		isMedia,
+		session.dcOk,
+		parsedDstHost,
+		settings,
+	)
+}
+
+func buildMtProtoWorkerDestinationPlan(workerDomain string, dc int, isMedia bool, settings runtimeSettings) tgwsroute.WorkerDestinationPlan {
+	parsedDstHost, dcOK := tgwsroute.WorkerCanonicalIPv4ForDC(dc)
+	return resolveWorkerDestinationPlan(workerDomain, dc, isMedia, dcOK, parsedDstHost, settings)
 }
 
 func buildCfWorkerDestinationPlan(workerDomain string, session *initSession, parsedDstHost string, settings runtimeSettings) tgwsroute.WorkerDestinationPlan {
