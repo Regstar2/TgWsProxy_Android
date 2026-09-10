@@ -2,6 +2,15 @@
 
 All notable user-facing changes are listed here. Detailed notes for older releases: [docs/releases/](docs/releases/).
 
+## Unreleased - Worker transport investigation (#29, PR #39)
+
+- Worker WebSocket close/cancellation no longer waits behind a blocked write; stream deadlines reach the socket and frame writes have a 45-second ceiling.
+- Removed the unsuccessful 65535 + 1 fragment probe and restored one complete outbound WebSocket message. Removed shared 16-KiB segmentation that also changed packet-oriented routes.
+- Worker source now connects TCP lazily, orders asynchronous message conversion with writes, bounds its queue and cancels pending writes on close.
+- Added correlated Worker message/write logs, a deployed revision header and Linux/Android TCP delivery counters during stalls.
+- Native rebuild inputs now include all Go subpackages and module files, preventing stale native libraries after frontend changes.
+- Added real local TCP/TLS bulk regression tests, deployed-handler queue tests and a PowerShell build/install/log capture script. Android/Cloudflare/Telegram media acceptance remains pending.
+
 ## 1.10.13 - 2026-08-26
 - MTProto WebSocket receive path now reassembles fragmented/continuation messages instead of dropping continuation frames.
 - Added 16 MiB protection for individual WebSocket frames and accumulated fragmented messages before payload allocation/delivery.

@@ -3,7 +3,7 @@
 Cloudflare Worker route is an optional WebSocket upstream route for TgWsProxy Android. The Android app connects to:
 
 ```text
-wss://<worker-domain>/apiws?dst=<telegram-dc-ip>&dc=<dc-id>&media=<0-or-1>
+wss://<worker-domain>/apiws?dst=<telegram-dc-ip>&dc=<dc-id>&media=<0-or-1>&sid=<session-id>
 ```
 
 In the app, paste only the Worker hostname, without `https://`, `wss://`, or `/apiws`:
@@ -26,7 +26,7 @@ Create your own Worker. Do not use random public Worker domains from other peopl
 2. Go to **Workers & Pages**.
 3. Create a Worker.
 4. Open **Edit code**.
-5. Paste the Worker code from the section below.
+5. Paste the complete deployable Worker source linked below (also update existing Workers).
 6. Deploy the Worker.
 7. Copy the hostname, for example `example.username.workers.dev`.
 8. In TgWsProxy Android, open **Settings** -> **Cloudflare Worker** and paste the hostname.
@@ -38,253 +38,36 @@ Deployable source: [scripts/cloudflare-worker/worker.js](../../scripts/cloudflar
 
 The Worker uses **lazy TCP connect**: it accepts the WebSocket upgrade immediately, waits for the first client frame, then opens the Telegram TCP socket and writes that frame. This avoids Telegram closing an idle TCP connection opened before the MTProto init packet arrives.
 
-```javascript
-import { connect } from "cloudflare:sockets";
+Use the source file above as the single implementation; do not copy an older inline example. Updating the APK does not deploy JavaScript to Cloudflare.
 
-async function toBytes(data) {
-    if (data instanceof ArrayBuffer) {
-        return new Uint8Array(data);
-    }
-    if (Array.isArray(data)) {
-        return new Uint8Array(data);
-    }
-    if (data instanceof Uint8Array) {
-        return data;
-    }
-    if (typeof data === "string") {
-        return new TextEncoder().encode(data);
-    }
-    if (data && typeof data.arrayBuffer === "function") {
-        const ab = await data.arrayBuffer();
-        return new Uint8Array(ab);
-    }
-    return new Uint8Array();
-}
+The current source returns `X-Tgws-Worker-Revision: worker-stream-v2`. Android logs it as `worker_revision=worker-stream-v2` after HTTP 101. `unknown` means the response did not identify this revision.
 
-function createWriteQueue(writer) {
-    let chain = Promise.resolve();
-    return (chunk) => {
-        chain = chain
-            .then(() => writer.write(chunk))
-            .catch((error) => {
-                console.error("write queue failed", {
-                    error: error?.message ?? String(error),
-                });
-                throw error;
-            });
-        return chain;
-    };
-}
+Payload conversion and TCP writes run in arrival order, including asynchronous Blob conversion. The first nonempty message opens TCP. Closing either side cancels the socket immediately, without waiting for a blocked `writer.close()`. The pending outbound queue is bounded to 32 MiB; exceeding it closes the session with `tcp_backlog_limit` instead of silently dropping bytes.
 
-export default {
-    async fetch(request) {
-        if ((request.headers.get("Upgrade") || "").toLowerCase() !== "websocket") {
-            return new Response("Expected websocket", { status: 426 });
-        }
+[Cloudflare's socket API](https://developers.cloudflare.com/workers/runtime-apis/tcp-sockets/) defines `socket.close()` as forcibly closing both streams; a stream writer close alone is not the cancellation mechanism.
 
-        const url = new URL(request.url);
-        if (url.pathname !== "/apiws") {
-            return new Response("Not found", { status: 404 });
-        }
+## Correlating a device stall
 
-        const dst = url.searchParams.get("dst");
-        if (!dst) {
-            return new Response("Missing dst", { status: 400 });
-        }
+1. Set the Worker text variable `WORKER_DIAGNOSTICS` to `1` and deploy.
+2. Open Cloudflare live logs before reproducing the problem.
+3. Match Worker `sid` with Android `session_id`. For each WS message the Worker logs `ws message received`, `tcp write start` and `tcp write end`, including sequence, byte counts and timings.
+4. `tcp read` identifies downstream bytes; `relay close` gives totals and the termination reason. No payload, MTProto keys or secrets are logged.
+5. Disable the diagnostic variable after collecting the failing session to reduce log volume.
 
-        const dc = url.searchParams.get("dc") ?? "?";
-        const media = url.searchParams.get("media") ?? "?";
-        console.log("apiws accepted", { dst, dc, media });
+Android samples TCP state every two seconds during a blocked traced write: `unacked`, `retrans`, `total_retrans`, `rto_us`, `rtt_us`, `cwnd`, `bytes_acked`, `bytes_sent`, `notsent`, `snd_wnd`. Missing kernel counters are `-1`, not zero. The total send queue includes both unsent and unacknowledged bytes. TCP counters describe encrypted transport bytes, while frame-write counts describe bytes supplied to TLS.
 
-        const requestedProtocols = (request.headers.get("Sec-WebSocket-Protocol") || "")
-            .split(",")
-            .map((value) => value.trim().toLowerCase());
-        const useBinaryProtocol = requestedProtocols.includes("binary");
+A frame write has a 45-second ceiling (or an earlier caller deadline). A partial failed frame terminates the connection: it must not be replayed on the existing encrypted stream. A timeout is a failure observation, not evidence of successful media transfer.
 
-        const pair = new WebSocketPair();
-        const client = pair[0];
-        const server = pair[1];
-        server.accept();
+## Destination baseline
 
-        let socket = null;
-        let tcpReader = null;
-        let tcpWriter = null;
-        let enqueueWrite = null;
-        let readyPromise = null;
-        let wsToTcpBytes = 0;
-        let tcpToWsBytes = 0;
-        let tcpToWsLoopStarted = false;
-        let relayClosed = false;
+Start with `PRESERVE_ORIGINAL_DST`. A transfer's bulk upload may use DC2 `media=false`; the UI category "media" is not the MTProto signed-DC flag.
 
-        const closeRelay = (reason) => {
-            if (relayClosed) {
-                return;
-            }
-            relayClosed = true;
-            console.log("relay close", {
-                reason,
-                dst,
-                wsToTcpBytes,
-                tcpToWsBytes,
-            });
-            try {
-                server.close();
-            } catch {}
-            if (socket) {
-                try {
-                    socket.close();
-                } catch {}
-            }
-        };
+The reviewed [Flowseal revision](https://github.com/Flowseal/tg-ws-proxy/tree/f200e33fd283143a9f101d62aaf9d8c1468a23fe) does not unconditionally route every Worker session to `149.154.167.220`. Its DC4 map/fallback behavior must not be confused with Android's `EXPERIMENTAL_FORCE_MEDIA_DC4` destination override. Keep that override a separate A/B and preserve the original logical signed DC.
 
-        const writeWsToTcp = async (chunk) => {
-            await enqueueWrite(chunk);
-            wsToTcpBytes += chunk.byteLength;
-            console.log("ws->tcp packet", {
-                dst,
-                bytes: chunk.byteLength,
-                total: wsToTcpBytes,
-            });
-        };
 
-        const startTcpToWsLoop = () => {
-            if (tcpToWsLoopStarted) {
-                return;
-            }
-            tcpToWsLoopStarted = true;
-            console.log("relay start", { dst });
+## Worker pool
 
-            (async () => {
-                try {
-                    while (true) {
-                        const { value, done } = await tcpReader.read();
-                        if (done) {
-                            break;
-                        }
-                        if (!value || value.byteLength === 0) {
-                            continue;
-                        }
-                        tcpToWsBytes += value.byteLength;
-                        console.log("tcp->ws packet", {
-                            dst,
-                            bytes: value.byteLength,
-                            total: tcpToWsBytes,
-                        });
-                        server.send(value);
-                    }
-                } catch (error) {
-                    console.error("tcp->ws read failed", {
-                        dst,
-                        error: error?.message ?? String(error),
-                    });
-                } finally {
-                    console.log("tcp closed", { dst });
-                    try {
-                        tcpReader.releaseLock();
-                    } catch {}
-                    closeRelay("tcp_read_done");
-                }
-            })();
-        };
-
-        const initTcp = async (firstChunk) => {
-            console.log("ws first packet", { dst, bytes: firstChunk.byteLength });
-            console.log("tcp connect start", { dst });
-
-            socket = connect(
-                { hostname: dst, port: 443 },
-                { secureTransport: "off", allowHalfOpen: true },
-            );
-            tcpReader = socket.readable.getReader();
-            tcpWriter = socket.writable.getWriter();
-            enqueueWrite = createWriteQueue(tcpWriter);
-
-            socket.opened
-                .then(() => console.log("tcp opened", { dst }))
-                .catch((error) =>
-                    console.error("tcp open failed", {
-                        dst,
-                        error: error?.message ?? String(error),
-                    }),
-                );
-
-            try {
-                await socket.opened;
-                await writeWsToTcp(firstChunk);
-                startTcpToWsLoop();
-            } catch (error) {
-                console.error("lazy tcp init failed", {
-                    dst,
-                    error: error?.message ?? String(error),
-                });
-                closeRelay("tcp_init_failed");
-                throw error;
-            }
-        };
-
-        server.addEventListener("message", async (event) => {
-            try {
-                const chunk = await toBytes(event.data);
-                if (!chunk || chunk.byteLength === 0) {
-                    return;
-                }
-
-                if (!readyPromise) {
-                    readyPromise = initTcp(chunk);
-                    await readyPromise;
-                    return;
-                }
-
-                await readyPromise;
-                await writeWsToTcp(chunk);
-            } catch (error) {
-                console.error("ws->tcp failed", {
-                    dst,
-                    error: error?.message ?? String(error),
-                });
-                closeRelay("ws_to_tcp_failed");
-            }
-        });
-
-        server.addEventListener("close", () => {
-            if (!readyPromise) {
-                closeRelay("ws_closed_before_first_packet");
-                return;
-            }
-            (async () => {
-                try {
-                    await tcpWriter?.close();
-                } catch {}
-                try {
-                    socket?.close();
-                } catch {}
-                closeRelay("ws_closed");
-            })();
-        });
-
-        server.addEventListener("error", () => {
-            closeRelay("ws_error");
-        });
-
-        const headers = useBinaryProtocol
-            ? { "Sec-WebSocket-Protocol": "binary" }
-            : undefined;
-
-        return new Response(null, { status: 101, webSocket: client, headers });
-    },
-};
-```
-
-## Worker Pool Metrics
-
-TgWsProxy Android 1.7.4 can reuse prepared Worker WebSocket connections when Worker route is enabled by the effective Wi-Fi/Mobile policy.
-
-- **Worker pool hits**: a prepared Worker connection was reused.
-- **Worker pool misses**: no prepared Worker connection was available, so a normal Worker dial was used.
-- **Worker pool idle**: prepared Worker connections currently waiting for use.
-- **Worker pool errors**: background Worker pool refill errors.
-
-Pool misses are not automatically bad. If misses stay high and errors grow, the Worker route may be unstable or the domain may be incorrect.
+The current MTProto Flowseal-parity path uses a fresh Worker WebSocket for each session and bypasses Worker preconnect. Pool counters from other routes do not establish whether this path delivered any data.
 
 ## Diagnostics
 

@@ -204,12 +204,14 @@ func mtProtoStatusField(value string) string {
 
 type mtProtoWorkerConnector struct {
 	dial           mtProtoWorkerDial
+	dialContext    func(context.Context, string, string, string) (mtProtoFrameSocket, error)
 	flowsealParity bool
 }
 
 func newMtProtoWorkerConnector() *mtProtoWorkerConnector {
 	return &mtProtoWorkerConnector{
 		dial:           dialFlowsealWorkerCandidate,
+		dialContext:    dialFlowsealWorkerCandidateContext,
 		flowsealParity: true,
 	}
 }
@@ -222,7 +224,7 @@ func (c *mtProtoWorkerConnector) Capability() mtproxyfrontend.OutboundCapability
 }
 
 func (c *mtProtoWorkerConnector) Connect(
-	_ context.Context,
+	ctx context.Context,
 	request mtproxyfrontend.OutboundRequest,
 ) (net.Conn, mtproxyfrontend.OutboundResult) {
 	result := mtproxyfrontend.OutboundResult{
@@ -300,6 +302,11 @@ func (c *mtProtoWorkerConnector) Connect(
 	var lastErr error
 	var lastReason string
 	for i := 0; i < maxAttempts; i++ {
+		if err := ctx.Err(); err != nil {
+			result.Err = err
+			result.Reason = "cancelled"
+			return nil, result
+		}
 		candidate := candidates[i]
 		path := buildWorkerWSPath(effectiveDC, target, effectiveMedia, sessionID)
 		prefix := fmt.Sprintf(
@@ -342,7 +349,11 @@ func (c *mtProtoWorkerConnector) Connect(
 					i+1,
 				)
 			}
-			ws, err = c.dial(candidate.Domain, path, prefix)
+			if c.dialContext != nil {
+				ws, err = c.dialContext(ctx, candidate.Domain, path, prefix)
+			} else {
+				ws, err = c.dial(candidate.Domain, path, prefix)
+			}
 		} else {
 			poolKey := WorkerPoolKey{
 				DC:           effectiveDC,
@@ -400,7 +411,15 @@ func (c *mtProtoWorkerConnector) Connect(
 			continue
 		}
 
+		stopCancel := context.AfterFunc(ctx, ws.Close)
 		stream, err := mtProtoWorkerWebSocketConn(ws, workerRelayInit, candidate.Domain)
+		stopCancel()
+		if ctx.Err() != nil {
+			ws.Close()
+			result.Err = ctx.Err()
+			result.Reason = "cancelled"
+			return nil, result
+		}
 		if err != nil {
 			ws.Close()
 			lastErr = err
@@ -501,11 +520,8 @@ func (s *mtProtoWebSocketStream) Close() error {
 		return nil
 	}
 	s.closed = true
-	if s.splitter != nil {
-		if tail := s.splitter.Flush(); len(tail) > 0 {
-			_ = s.socket.SendBatch(tail)
-		}
-	}
+	// Close is cancellation: do not flush an incomplete packet or wait on a
+	// blocked write. The writer owns splitter state until the socket is closed.
 	s.socket.Close()
 	return nil
 }
@@ -518,16 +534,25 @@ func (s *mtProtoWebSocketStream) RemoteAddr() net.Addr {
 	return s.remote
 }
 
-func (s *mtProtoWebSocketStream) SetDeadline(time.Time) error {
-	return nil
+func (s *mtProtoWebSocketStream) SetDeadline(t time.Time) error {
+	if socket, ok := s.socket.(interface{ SetDeadline(time.Time) error }); ok {
+		return socket.SetDeadline(t)
+	}
+	return fmt.Errorf("WebSocket transport does not support deadlines")
 }
 
-func (s *mtProtoWebSocketStream) SetReadDeadline(time.Time) error {
-	return nil
+func (s *mtProtoWebSocketStream) SetReadDeadline(t time.Time) error {
+	if socket, ok := s.socket.(interface{ SetReadDeadline(time.Time) error }); ok {
+		return socket.SetReadDeadline(t)
+	}
+	return fmt.Errorf("WebSocket transport does not support deadlines")
 }
 
-func (s *mtProtoWebSocketStream) SetWriteDeadline(time.Time) error {
-	return nil
+func (s *mtProtoWebSocketStream) SetWriteDeadline(t time.Time) error {
+	if socket, ok := s.socket.(interface{ SetWriteDeadline(time.Time) error }); ok {
+		return socket.SetWriteDeadline(t)
+	}
+	return fmt.Errorf("WebSocket transport does not support deadlines")
 }
 
 func (s *mtProtoWebSocketStream) RouteDiagnostics() mtproxyfrontend.RouteDiagnostics {

@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"crypto/rand"
 	"crypto/tls"
 	"encoding/base64"
@@ -14,7 +15,11 @@ import (
 )
 
 func dialFlowsealWorkerCandidate(domain, path, logPrefix string) (mtProtoFrameSocket, error) {
-	ws, err := connectFlowsealRawWebSocket(domain, domain, path, 10)
+	return dialFlowsealWorkerCandidateContext(context.Background(), domain, path, logPrefix)
+}
+
+func dialFlowsealWorkerCandidateContext(ctx context.Context, domain, path, logPrefix string) (mtProtoFrameSocket, error) {
+	ws, err := connectFlowsealRawWebSocketContext(ctx, domain, domain, path, 10)
 	if err != nil {
 		logDomainConnectFailure(logPrefix, domain, domain, err)
 		return nil, err
@@ -26,6 +31,10 @@ func dialFlowsealWorkerCandidate(domain, path, logPrefix string) (mtProtoFrameSo
 }
 
 func connectFlowsealRawWebSocket(host, domain, path string, timeout float64) (*flowsealRawWebSocket, error) {
+	return connectFlowsealRawWebSocketContext(context.Background(), host, domain, path, timeout)
+}
+
+func connectFlowsealRawWebSocketContext(ctx context.Context, host, domain, path string, timeout float64) (*flowsealRawWebSocket, error) {
 	if path == "" {
 		path = "/apiws"
 	}
@@ -38,11 +47,13 @@ func connectFlowsealRawWebSocket(host, domain, path string, timeout float64) (*f
 	}
 
 	dialer := &net.Dialer{Timeout: time.Duration(dialTimeout * float64(time.Second))}
-	rawConn, err := dialer.Dial("tcp", joinAddr(host, 443))
+	rawConn, err := dialer.DialContext(ctx, "tcp", joinAddr(host, 443))
 	if err != nil {
 		return nil, &wsStageError{Stage: "tcp_dial", Err: err}
 	}
 	setSockOpts(rawConn)
+	stopCancel := context.AfterFunc(ctx, func() { _ = rawConn.Close() })
+	defer stopCancel()
 
 	tlsConn := tls.Client(rawConn, &tls.Config{
 		InsecureSkipVerify: true,
@@ -50,7 +61,7 @@ func connectFlowsealRawWebSocket(host, domain, path string, timeout float64) (*f
 	})
 	deadline := time.Now().Add(time.Duration(timeout * float64(time.Second)))
 	_ = tlsConn.SetDeadline(deadline)
-	if err := tlsConn.Handshake(); err != nil {
+	if err := tlsConn.HandshakeContext(ctx); err != nil {
 		_ = tlsConn.Close()
 		return nil, &wsStageError{Stage: "tls_handshake", Err: err}
 	}
@@ -102,6 +113,12 @@ func connectFlowsealRawWebSocket(host, domain, path string, timeout float64) (*f
 		statusCode, _ = strconv.Atoi(parts[1])
 	}
 	if statusCode == 101 {
+		if logInfo != nil {
+			state := tlsConn.ConnectionState()
+			logInfo.Printf("MTProto Worker transport ready session_id=%s remote=%s tls_version=%x cipher=%x worker_revision=%s",
+				flowsealSessionIDFromPath(path), rawConn.RemoteAddr(), state.Version, state.CipherSuite,
+				flowsealResponseHeader(responseLines, "X-Tgws-Worker-Revision"))
+		}
 		return &flowsealRawWebSocket{
 			conn:      tlsConn,
 			reader:    reader,
@@ -146,4 +163,14 @@ func buildFlowsealUpgradeRequest(path, domain, websocketKey string) string {
 			"\r\n",
 		path, domain, websocketKey,
 	)
+}
+
+func flowsealResponseHeader(lines []string, name string) string {
+	for _, line := range lines {
+		key, value, ok := strings.Cut(line, ":")
+		if ok && strings.EqualFold(strings.TrimSpace(key), name) {
+			return mtProtoStatusField(value)
+		}
+	}
+	return "unknown"
 }

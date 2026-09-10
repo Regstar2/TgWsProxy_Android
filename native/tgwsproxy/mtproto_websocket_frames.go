@@ -4,20 +4,13 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+	"time"
 )
 
 // mtProtoMaxWebSocketMessageLen mirrors the current Flowseal runtime guard.
 // The limit is applied both to individual frames and to the accumulated
 // fragmented message before it is exposed to the MTProto stream.
 const mtProtoMaxWebSocketMessageLen = 16 * 1024 * 1024
-
-// mtProtoMaxOutboundWebSocketPayloadLen deliberately keeps each outbound
-// WebSocket message below the 64 KiB reads produced by the MTProto bridge.
-// Real-device diagnostics for #29 showed repeated 64 KiB Worker messages with
-// no downstream response, followed by Cloudflare write timeouts. Splitting the
-// byte stream into smaller WebSocket messages preserves TCP stream semantics at
-// the Worker while adding backpressure between writes.
-const mtProtoMaxOutboundWebSocketPayloadLen = 16 * 1024
 
 // mtProtoSafeFrameSocket adds bounded WebSocket message reassembly to the
 // existing RawWebSocket without changing the Android-specific transport,
@@ -50,21 +43,10 @@ func (s *mtProtoSafeFrameSocket) Send(data []byte) error {
 	if s == nil || s.raw == nil {
 		return fmt.Errorf("WebSocket closed")
 	}
-	if len(data) == 0 {
-		return s.writeFrameFull(opBinary, nil)
+	if len(data) > s.messageLimit() {
+		return fmt.Errorf("WS message too large: %d bytes", len(data))
 	}
-
-	for len(data) > 0 {
-		chunkLen := len(data)
-		if chunkLen > mtProtoMaxOutboundWebSocketPayloadLen {
-			chunkLen = mtProtoMaxOutboundWebSocketPayloadLen
-		}
-		if err := s.writeFrameFull(opBinary, data[:chunkLen]); err != nil {
-			return err
-		}
-		data = data[chunkLen:]
-	}
-	return nil
+	return s.writeFrameFull(opBinary, data)
 }
 
 func (s *mtProtoSafeFrameSocket) SendBatch(parts [][]byte) error {
@@ -106,7 +88,21 @@ func writeFull(writer io.Writer, data []byte) error {
 }
 
 func (s *mtProtoSafeFrameSocket) Close() {
-	s.raw.Close()
+	if !s.raw.closed.Swap(true) {
+		_ = s.raw.conn.Close()
+	}
+}
+
+func (s *mtProtoSafeFrameSocket) SetDeadline(t time.Time) error {
+	return s.raw.conn.SetDeadline(t)
+}
+
+func (s *mtProtoSafeFrameSocket) SetReadDeadline(t time.Time) error {
+	return s.raw.conn.SetReadDeadline(t)
+}
+
+func (s *mtProtoSafeFrameSocket) SetWriteDeadline(t time.Time) error {
+	return s.raw.conn.SetWriteDeadline(t)
 }
 
 func (s *mtProtoSafeFrameSocket) Recv() ([]byte, error) {
@@ -121,13 +117,7 @@ func (s *mtProtoSafeFrameSocket) Recv() ([]byte, error) {
 
 		switch opcode {
 		case opClose:
-			closePayload := payload
-			if len(closePayload) > 2 {
-				closePayload = closePayload[:2]
-			}
-			_ = s.writeFrameFull(opClose, closePayload)
-			s.raw.closed.Store(true)
-			_ = s.raw.conn.Close()
+			s.Close()
 			return nil, io.EOF
 
 		case opPing:

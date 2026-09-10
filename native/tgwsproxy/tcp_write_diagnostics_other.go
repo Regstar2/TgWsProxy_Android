@@ -15,3 +15,7 @@ func tcpNotSentBytes(net.Conn) int {
 func tcpSendBufferBytes(net.Conn) int {
 	return -1
 }
+
+func tcpTransportState(net.Conn) string {
+	return "tcp_info=unavailable"
+}

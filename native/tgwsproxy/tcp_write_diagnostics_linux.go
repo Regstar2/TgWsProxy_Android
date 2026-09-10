@@ -3,6 +3,7 @@
 package main
 
 import (
+	"fmt"
 	"net"
 	"syscall"
 	"unsafe"
@@ -72,4 +73,9 @@ func tcpSendBufferBytes(conn net.Conn) int {
 		return -1
 	}
 	return value
+}
+
+func tcpTransportState(conn net.Conn) string {
+	return fmt.Sprintf("tcp_send_queue=%d tcp_not_sent=%d %s",
+		tcpSendQueueBytes(conn), tcpNotSentBytes(conn), tcpInfoFields(conn))
 }

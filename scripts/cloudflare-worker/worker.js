@@ -1,173 +1,165 @@
 import { connect } from "cloudflare:sockets";
 
+const REVISION = "worker-stream-v2";
+const MAX_PENDING_BYTES = 32 * 1024 * 1024;
+
 async function toBytes(data) {
-	if (data instanceof ArrayBuffer) {
-		return new Uint8Array(data);
-	}
-	if (Array.isArray(data)) {
-		return new Uint8Array(data);
-	}
-	if (data instanceof Uint8Array) {
-		return data;
-	}
-	if (typeof data === "string") {
-		return new TextEncoder().encode(data);
-	}
-	if (data && typeof data.arrayBuffer === "function") {
-		const ab = await data.arrayBuffer();
-		return new Uint8Array(ab);
-	}
-	return new Uint8Array();
+  if (data instanceof ArrayBuffer) return new Uint8Array(data);
+  if (ArrayBuffer.isView(data)) {
+    return new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
+  }
+  if (Array.isArray(data)) return new Uint8Array(data);
+  if (typeof data === "string") return new TextEncoder().encode(data);
+  if (data && typeof data.arrayBuffer === "function") {
+    return new Uint8Array(await data.arrayBuffer());
+  }
+  throw new TypeError("Unsupported WebSocket payload");
 }
 
-function createWriteQueue(writer) {
-	let chain = Promise.resolve();
-	return (chunk) => {
-		chain = chain
-			.then(() => writer.write(chunk))
-			.catch((error) => {
-				console.error("write queue failed", {
-					error: error?.message ?? String(error),
-				});
-				throw error;
-			});
-		return chain;
-	};
+function dataSize(data) {
+  if (typeof data === "string") return new TextEncoder().encode(data).byteLength;
+  return data?.byteLength ?? data?.size ?? data?.length ?? 0;
 }
 
-export default {
-	async fetch(request) {
-		if ((request.headers.get("Upgrade") || "").toLowerCase() !== "websocket") {
-			return new Response("Expected websocket", { status: 426 });
-		}
+// The injected connector lets tests exercise this handler without contacting
+// Telegram. Production always uses cloudflare:sockets below.
+export function createWorkerHandler(connectTCP) {
+  return {
+    async fetch(request, env = {}) {
+      if ((request.headers.get("Upgrade") || "").toLowerCase() !== "websocket") {
+        return new Response("WebSocket upgrade required", { status: 426 });
+      }
+      const url = new URL(request.url);
+      if (url.pathname !== "/apiws") {
+        return new Response("Not found", { status: 404 });
+      }
+      const dst = url.searchParams.get("dst");
+      if (!dst) return new Response("Missing dst", { status: 400 });
 
-		const url = new URL(request.url);
-		if (url.pathname !== "/apiws") {
-			return new Response("Not found", { status: 404 });
-		}
+      const meta = {
+        sid: url.searchParams.get("sid") || "?",
+        dst,
+        dc: url.searchParams.get("dc"),
+        media: url.searchParams.get("media"),
+        revision: REVISION,
+      };
+      const started = Date.now();
+      const diagnostic = env.WORKER_DIAGNOSTICS === "1";
+      const log = (event, fields = {}) =>
+        console.log(event, { ...meta, elapsed_ms: Date.now() - started, ...fields });
+      const trace = (event, fields) => {
+        if (diagnostic) log(event, fields);
+      };
 
-		const dst = url.searchParams.get("dst");
-		if (!dst) {
-			return new Response("Missing dst", { status: 400 });
-		}
+      const pair = new WebSocketPair();
+      const client = pair[0];
+      const server = pair[1];
+      server.accept();
 
-		const dc = url.searchParams.get("dc") ?? "?";
-		const media = url.searchParams.get("media") ?? "?";
-		const sid = url.searchParams.get("sid") ?? "?";
+      let socket;
+      let writer;
+      let closed = false;
+      let chain = Promise.resolve();
+      let sequence = 0;
+      let receivedBytes = 0;
+      let writtenBytes = 0;
+      let downstreamBytes = 0;
+      let pendingBytes = 0;
 
-		const pair = new WebSocketPair();
-		const client = pair[0];
-		const server = pair[1];
-		server.accept();
+      function closeRelay(reason, code = 1000) {
+        if (closed) return;
+        closed = true;
+        log("relay close", {
+          reason,
+          received_bytes: receivedBytes,
+          tcp_written_bytes: writtenBytes,
+          downstream_bytes: downstreamBytes,
+          pending_bytes: pendingBytes,
+        });
+        // writer.close() queues behind a pending write and cannot cancel it.
+        // Close the socket directly so both directions stop even under pressure.
+        try { Promise.resolve(socket?.close()).catch(() => {}); } catch {}
+        try { server.close(code, reason); } catch {}
+      }
 
-		let wsToTcpBytes = 0;
-		let tcpToWsBytes = 0;
-		let relayClosed = false;
+      function startTCP() {
+        if (socket) return;
+        socket = connectTCP(
+          { hostname: dst, port: 443 },
+          { secureTransport: "off", allowHalfOpen: true },
+        );
+        writer = socket.writable.getWriter();
+        trace("tcp connect start", {});
+        socket.opened.then(() => trace("tcp opened", {}))
+          .catch(() => closeRelay("tcp_open_failed", 1011));
+        socket.closed.catch(() => closeRelay("tcp_failed", 1011));
 
-		console.log("apiws accepted", { sid, dst, dc, media });
+        const reader = socket.readable.getReader();
+        (async () => {
+          let reason = "tcp_eof";
+          try {
+            while (!closed) {
+              const { value, done } = await reader.read();
+              if (done || closed) break;
+              if (!value?.byteLength) continue;
+              downstreamBytes += value.byteLength;
+              trace("tcp read", {
+                bytes: value.byteLength,
+                downstream_bytes: downstreamBytes,
+              });
+              server.send(value);
+            }
+          } catch {
+            reason = "tcp_read_failed";
+          } finally {
+            try { reader.releaseLock(); } catch {}
+            closeRelay(reason, reason === "tcp_eof" ? 1000 : 1011);
+          }
+        })();
+      }
 
-		const socket = connect(
-			{ hostname: dst, port: 443 },
-			{ secureTransport: "off", allowHalfOpen: true },
-		);
-		const tcpReader = socket.readable.getReader();
-		const tcpWriter = socket.writable.getWriter();
-		const enqueueWrite = createWriteQueue(tcpWriter);
+      server.addEventListener("message", (event) => {
+        if (closed) return;
+        const seq = ++sequence;
+        const size = dataSize(event.data);
+        receivedBytes += size;
+        trace("ws message received", { seq, bytes: size, received_bytes: receivedBytes });
+        if (pendingBytes + size > MAX_PENDING_BYTES) {
+          closeRelay("tcp_backlog_limit", 1011);
+          return;
+        }
+        pendingBytes += size;
+        // Enqueue before asynchronous conversion: a later ArrayBuffer must not
+        // overtake an earlier Blob. Exactly one TCP write runs at a time.
+        chain = chain.then(async () => {
+          if (closed) return;
+          const chunk = await toBytes(event.data);
+          if (closed || !chunk.byteLength) return;
+          startTCP(); // The first nonempty message, including relay_init.
+          const writeStarted = Date.now();
+          trace("tcp write start", { seq, bytes: chunk.byteLength, pending_bytes: pendingBytes });
+          await writer.write(chunk);
+          writtenBytes += chunk.byteLength;
+          trace("tcp write end", {
+            seq,
+            bytes: chunk.byteLength,
+            duration_ms: Date.now() - writeStarted,
+            tcp_written_bytes: writtenBytes,
+          });
+        }).catch(() => closeRelay("ws_to_tcp_failed", 1011))
+          .finally(() => { pendingBytes -= size; });
+      });
+      server.addEventListener("close", () => closeRelay("ws_closed"));
+      server.addEventListener("error", () => closeRelay("ws_error", 1011));
 
-		const closeRelay = (reason) => {
-			if (relayClosed) {
-				return;
-			}
-			relayClosed = true;
-			console.log("relay close", {
-				sid,
-				dst,
-				reason,
-				wsToTcpBytes,
-				tcpToWsBytes,
-			});
-			try {
-				server.close();
-			} catch {}
-			try {
-				socket.close();
-			} catch {}
-		};
+      log("apiws accepted", { tcp_connect: "lazy", diagnostics: diagnostic });
+      const headers = { "X-Tgws-Worker-Revision": REVISION };
+      const protocols = (request.headers.get("Sec-WebSocket-Protocol") || "")
+        .split(",").map((value) => value.trim());
+      if (protocols.includes("binary")) headers["Sec-WebSocket-Protocol"] = "binary";
+      return new Response(null, { status: 101, webSocket: client, headers });
+    },
+  };
+}
 
-		socket.opened
-			.then(() => console.log("tcp opened", { sid, dst }))
-			.catch((error) => {
-				console.error("tcp open failed", {
-					sid,
-					dst,
-					error: error?.message ?? String(error),
-				});
-				closeRelay("tcp_open_failed");
-			});
-
-		server.addEventListener("message", async (event) => {
-			try {
-				const chunk = await toBytes(event.data);
-				if (!chunk || chunk.byteLength === 0) {
-					return;
-				}
-				await enqueueWrite(chunk);
-				wsToTcpBytes += chunk.byteLength;
-			} catch (error) {
-				console.error("ws->tcp failed", {
-					sid,
-					dst,
-					error: error?.message ?? String(error),
-				});
-				closeRelay("ws_to_tcp_failed");
-			}
-		});
-
-		server.addEventListener("close", async () => {
-			try {
-				await tcpWriter.close();
-			} catch {}
-			closeRelay("ws_closed");
-		});
-
-		server.addEventListener("error", () => {
-			closeRelay("ws_error");
-		});
-
-		(async () => {
-			try {
-				while (true) {
-					const { value, done } = await tcpReader.read();
-					if (done) {
-						break;
-					}
-					if (!value || value.byteLength === 0) {
-						continue;
-					}
-					tcpToWsBytes += value.byteLength;
-					server.send(value);
-				}
-			} catch (error) {
-				console.error("tcp->ws read failed", {
-					sid,
-					dst,
-					error: error?.message ?? String(error),
-				});
-			} finally {
-				try {
-					tcpReader.releaseLock();
-				} catch {}
-				closeRelay("tcp_read_done");
-			}
-		})();
-
-		const requestedProtocols = (request.headers.get("Sec-WebSocket-Protocol") || "")
-			.split(",")
-			.map((value) => value.trim().toLowerCase());
-		const headers = requestedProtocols.includes("binary")
-			? { "Sec-WebSocket-Protocol": "binary" }
-			: undefined;
-
-		return new Response(null, { status: 101, webSocket: client, headers });
-	},
-};
+export default createWorkerHandler(connect);
