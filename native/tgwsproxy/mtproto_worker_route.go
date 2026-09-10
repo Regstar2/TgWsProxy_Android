@@ -398,6 +398,7 @@ func (c *mtProtoWorkerConnector) Connect(
 			workerStream.sessionID = sessionID
 			workerStream.workerDst = target
 		}
+		stream = wrapMtProtoWorkerPayloadTrace(stream, request, sessionID, target)
 
 		result.ActualBackend = mtProtoWorkerBackend
 		result.Reason = "connected"
