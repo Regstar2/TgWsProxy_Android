@@ -56,10 +56,10 @@ func (ws *flowsealRawWebSocket) sendFrame(frame []byte, payloadBytes int) error 
 		return fmt.Errorf("WebSocket closed")
 	}
 
-	// Keep application data frames ordered while allowing control frames from
-	// the receive loop to use writeMu during a backpressure wait. This more
-	// closely matches Flowseal's asyncio behavior, where await writer.drain()
-	// yields without preventing the recv task from replying to ping frames.
+	// Keep application data frames ordered. The send mutex intentionally stays
+	// held across the post-write drain so the next data frame cannot outrun the
+	// Flowseal-style high/low watermarks. Control frames use writeMu only and can
+	// still be emitted while this goroutine is waiting for the queue to drain.
 	ws.sendMu.Lock()
 	defer ws.sendMu.Unlock()
 
@@ -70,20 +70,7 @@ func (ws *flowsealRawWebSocket) sendFrame(frame []byte, payloadBytes int) error 
 	sequence := ws.sendCount.Add(1)
 	trace := payloadBytes >= 64*1024 || sequence <= 2
 
-	if err := waitFlowsealBackpressure(
-		ws.conn,
-		ws.closed.Load,
-		ws.logSessionID(),
-		sequence,
-		payloadBytes,
-		len(frame),
-	); err != nil {
-		return err
-	}
-
 	ws.writeMu.Lock()
-	defer ws.writeMu.Unlock()
-
 	queueBefore := tcpSendQueueBytes(ws.conn)
 	notSentBefore := tcpNotSentBytes(ws.conn)
 	sendBufferBytes := tcpSendBufferBytes(ws.conn)
@@ -99,6 +86,8 @@ func (ws *flowsealRawWebSocket) sendFrame(frame []byte, payloadBytes int) error 
 	duration := time.Since(started)
 	queueAfter := tcpSendQueueBytes(ws.conn)
 	notSentAfter := tcpNotSentBytes(ws.conn)
+	ws.writeMu.Unlock()
+
 	if err != nil {
 		if logInfo != nil {
 			logInfo.Printf(
@@ -116,7 +105,15 @@ func (ws *flowsealRawWebSocket) sendFrame(frame []byte, payloadBytes int) error 
 			ws.logSessionID(), sequence, payloadBytes, len(frame), writtenFrameBytes, cumulative, duration.Milliseconds(), queueBefore, queueAfter, notSentBefore, notSentAfter, sendBufferBytes,
 		)
 	}
-	return nil
+
+	return drainFlowsealAfterWrite(
+		ws.conn,
+		ws.closed.Load,
+		ws.logSessionID(),
+		sequence,
+		payloadBytes,
+		len(frame),
+	)
 }
 
 func (ws *flowsealRawWebSocket) Recv() ([]byte, error) {
