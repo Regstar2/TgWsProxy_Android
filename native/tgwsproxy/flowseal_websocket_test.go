@@ -50,7 +50,7 @@ func TestWriteFlowsealFullCountReportsPartialWriteBeforeFailure(t *testing.T) {
 	}
 }
 
-func TestFlowsealRawWebSocketKeeps65536BytesInOneMessage(t *testing.T) {
+func TestFlowsealRawWebSocketFragments65536PayloadWithoutLength127Frame(t *testing.T) {
 	conn := &frameTestConn{reader: bytes.NewReader(nil), maxWrite: 16 * 1024}
 	ws := &flowsealRawWebSocket{
 		conn:      conn,
@@ -63,17 +63,28 @@ func TestFlowsealRawWebSocketKeeps65536BytesInOneMessage(t *testing.T) {
 		t.Fatalf("send: %v", err)
 	}
 	if got, want := conn.writes.Len(), 65550; got != want {
-		t.Fatalf("serialized frame bytes=%d want=%d", got, want)
+		t.Fatalf("serialized wire bytes=%d want=%d", got, want)
 	}
 	lengths := clientFramePayloadLengths(t, conn.writes.Bytes())
-	if len(lengths) != 1 || lengths[0] != len(payload) {
-		t.Fatalf("WebSocket message payloads=%v want=[%d]", lengths, len(payload))
+	if len(lengths) != 2 || lengths[0] != 65535 || lengths[1] != 1 {
+		t.Fatalf("WebSocket fragment payloads=%v want=[65535 1]", lengths)
+	}
+	wire := conn.writes.Bytes()
+	if wire[1]&0x7F == 127 {
+		t.Fatal("first diagnostic fragment must avoid RFC6455 length-127 encoding")
+	}
+	secondOffset := 2 + 2 + 4 + 65535
+	if secondOffset >= len(wire) {
+		t.Fatalf("second fragment offset=%d outside wire length=%d", secondOffset, len(wire))
+	}
+	if wire[secondOffset]&0x0F != byte(opContinuation) || wire[secondOffset]&0x80 == 0 {
+		t.Fatalf("second frame header=%#x want final continuation", wire[secondOffset])
 	}
 	if conn.writeCalls <= 1 {
 		t.Fatalf("write calls=%d want multiple transport writes for the short-write fixture", conn.writeCalls)
 	}
 	if got := ws.sendCount.Load(); got != 1 {
-		t.Fatalf("send attempt count=%d want=1", got)
+		t.Fatalf("send attempt count=%d want=1 logical message", got)
 	}
 	if got := ws.sentBytes.Load(); got != uint64(len(payload)) {
 		t.Fatalf("successful payload bytes=%d want=%d", got, len(payload))
