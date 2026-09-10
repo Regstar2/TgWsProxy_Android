@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"encoding/binary"
 	"errors"
 	"strings"
 	"testing"
@@ -62,24 +63,46 @@ func TestFlowsealRawWebSocketFragments65536PayloadWithoutLength127Frame(t *testi
 	if err := ws.Send(payload); err != nil {
 		t.Fatalf("send: %v", err)
 	}
-	if got, want := conn.writes.Len(), 65550; got != want {
+	wire := conn.writes.Bytes()
+	if got, want := len(wire), 65550; got != want {
 		t.Fatalf("serialized wire bytes=%d want=%d", got, want)
 	}
-	lengths := clientFramePayloadLengths(t, conn.writes.Bytes())
-	if len(lengths) != 2 || lengths[0] != 65535 || lengths[1] != 1 {
-		t.Fatalf("WebSocket fragment payloads=%v want=[65535 1]", lengths)
+
+	// First frame: non-final binary, masked, 65535-byte payload encoded with
+	// the 16-bit RFC6455 length form (126), never the 64-bit length form (127).
+	if got, want := wire[0]&0x0F, byte(opBinary); got != want {
+		t.Fatalf("first frame opcode=%d want=%d", got, want)
 	}
-	wire := conn.writes.Bytes()
-	if wire[1]&0x7F == 127 {
-		t.Fatal("first diagnostic fragment must avoid RFC6455 length-127 encoding")
+	if wire[0]&0x80 != 0 {
+		t.Fatalf("first frame header=%#x want non-final binary fragment", wire[0])
 	}
+	if got, want := wire[1]&0x7F, byte(126); got != want {
+		t.Fatalf("first frame length code=%d want=%d", got, want)
+	}
+	if got, want := binary.BigEndian.Uint16(wire[2:4]), uint16(65535); got != want {
+		t.Fatalf("first fragment payload length=%d want=%d", got, want)
+	}
+	if wire[1]&0x80 == 0 {
+		t.Fatal("first diagnostic fragment must be client-masked")
+	}
+
 	secondOffset := 2 + 2 + 4 + 65535
 	if secondOffset >= len(wire) {
 		t.Fatalf("second fragment offset=%d outside wire length=%d", secondOffset, len(wire))
 	}
-	if wire[secondOffset]&0x0F != byte(opContinuation) || wire[secondOffset]&0x80 == 0 {
+	if got, want := wire[secondOffset]&0x0F, byte(opContinuation); got != want {
+		t.Fatalf("second frame opcode=%d want continuation=%d", got, want)
+	}
+	if wire[secondOffset]&0x80 == 0 {
 		t.Fatalf("second frame header=%#x want final continuation", wire[secondOffset])
 	}
+	if got, want := wire[secondOffset+1]&0x7F, byte(1); got != want {
+		t.Fatalf("second fragment payload length=%d want=%d", got, want)
+	}
+	if wire[secondOffset+1]&0x80 == 0 {
+		t.Fatal("second diagnostic fragment must be client-masked")
+	}
+
 	if conn.writeCalls <= 1 {
 		t.Fatalf("write calls=%d want multiple transport writes for the short-write fixture", conn.writeCalls)
 	}
