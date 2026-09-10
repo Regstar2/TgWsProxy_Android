@@ -8,9 +8,24 @@ import (
 	"unsafe"
 )
 
-const linuxTIOCOUTQ = 0x5411
+const (
+	linuxTIOCOUTQ    = 0x5411
+	linuxSIOCOUTQNSD = 0x894B
+)
 
 func tcpSendQueueBytes(conn net.Conn) int {
+	return tcpIoctlInt(conn, linuxTIOCOUTQ)
+}
+
+// tcpNotSentBytes returns only bytes which have not yet been sent by TCP.
+// Unlike TIOCOUTQ/SIOCOUTQ, SIOCOUTQNSD excludes bytes already sent but not
+// acknowledged. That distinction matters for #29: using the total queue as a
+// drain signal can stall on healthy in-flight data.
+func tcpNotSentBytes(conn net.Conn) int {
+	return tcpIoctlInt(conn, linuxSIOCOUTQNSD)
+}
+
+func tcpIoctlInt(conn net.Conn, request uintptr) int {
 	tcpConn := underlyingTCPConn(conn)
 	if tcpConn == nil {
 		return -1
@@ -19,22 +34,22 @@ func tcpSendQueueBytes(conn net.Conn) int {
 	if err != nil {
 		return -1
 	}
-	pending := int32(-1)
+	value := int32(-1)
 	controlErr := rawConn.Control(func(fd uintptr) {
 		_, _, errno := syscall.Syscall(
 			syscall.SYS_IOCTL,
 			fd,
-			uintptr(linuxTIOCOUTQ),
-			uintptr(unsafe.Pointer(&pending)),
+			request,
+			uintptr(unsafe.Pointer(&value)),
 		)
 		if errno != 0 {
-			pending = -1
+			value = -1
 		}
 	})
-	if controlErr != nil || pending < 0 {
+	if controlErr != nil || value < 0 {
 		return -1
 	}
-	return int(pending)
+	return int(value)
 }
 
 func tcpSendBufferBytes(conn net.Conn) int {
