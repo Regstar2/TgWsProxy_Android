@@ -85,23 +85,25 @@ func (ws *flowsealRawWebSocket) sendFrame(frame []byte, payloadBytes int) error 
 	defer ws.writeMu.Unlock()
 
 	queueBefore := tcpSendQueueBytes(ws.conn)
+	notSentBefore := tcpNotSentBytes(ws.conn)
 	sendBufferBytes := tcpSendBufferBytes(ws.conn)
 	started := time.Now()
 	if logInfo != nil && trace {
 		logInfo.Printf(
-			"MTProto Worker Flowseal parity WS write start session_id=%s seq=%d payload_bytes=%d frame_bytes=%d tcp_send_queue_before=%d tcp_send_buffer_bytes=%d",
-			ws.logSessionID(), sequence, payloadBytes, len(frame), queueBefore, sendBufferBytes,
+			"MTProto Worker Flowseal parity WS write start session_id=%s seq=%d payload_bytes=%d frame_bytes=%d tcp_send_queue_before=%d tcp_not_sent_before=%d tcp_send_buffer_bytes=%d",
+			ws.logSessionID(), sequence, payloadBytes, len(frame), queueBefore, notSentBefore, sendBufferBytes,
 		)
 	}
 
 	writtenFrameBytes, err := writeFlowsealFullCount(ws.conn, frame)
 	duration := time.Since(started)
 	queueAfter := tcpSendQueueBytes(ws.conn)
+	notSentAfter := tcpNotSentBytes(ws.conn)
 	if err != nil {
 		if logInfo != nil {
 			logInfo.Printf(
-				"MTProto Worker Flowseal parity WS write failed session_id=%s seq=%d payload_bytes=%d frame_bytes=%d written_frame_bytes=%d duration_ms=%d tcp_send_queue_before=%d tcp_send_queue_after=%d tcp_send_buffer_bytes=%d error=%v",
-				ws.logSessionID(), sequence, payloadBytes, len(frame), writtenFrameBytes, duration.Milliseconds(), queueBefore, queueAfter, sendBufferBytes, err,
+				"MTProto Worker Flowseal parity WS write failed session_id=%s seq=%d payload_bytes=%d frame_bytes=%d written_frame_bytes=%d duration_ms=%d tcp_send_queue_before=%d tcp_send_queue_after=%d tcp_not_sent_before=%d tcp_not_sent_after=%d tcp_send_buffer_bytes=%d error=%v",
+				ws.logSessionID(), sequence, payloadBytes, len(frame), writtenFrameBytes, duration.Milliseconds(), queueBefore, queueAfter, notSentBefore, notSentAfter, sendBufferBytes, err,
 			)
 		}
 		return err
@@ -110,8 +112,8 @@ func (ws *flowsealRawWebSocket) sendFrame(frame []byte, payloadBytes int) error 
 	cumulative := ws.sentBytes.Add(uint64(payloadBytes))
 	if logInfo != nil && trace {
 		logInfo.Printf(
-			"MTProto Worker Flowseal parity WS send session_id=%s seq=%d payload_bytes=%d frame_bytes=%d written_frame_bytes=%d cumulative_payload_bytes=%d duration_ms=%d tcp_send_queue_before=%d tcp_send_queue_after=%d tcp_send_buffer_bytes=%d",
-			ws.logSessionID(), sequence, payloadBytes, len(frame), writtenFrameBytes, cumulative, duration.Milliseconds(), queueBefore, queueAfter, sendBufferBytes,
+			"MTProto Worker Flowseal parity WS send session_id=%s seq=%d payload_bytes=%d frame_bytes=%d written_frame_bytes=%d cumulative_payload_bytes=%d duration_ms=%d tcp_send_queue_before=%d tcp_send_queue_after=%d tcp_not_sent_before=%d tcp_not_sent_after=%d tcp_send_buffer_bytes=%d",
+			ws.logSessionID(), sequence, payloadBytes, len(frame), writtenFrameBytes, cumulative, duration.Milliseconds(), queueBefore, queueAfter, notSentBefore, notSentAfter, sendBufferBytes,
 		)
 	}
 	return nil
