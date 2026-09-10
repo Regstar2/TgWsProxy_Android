@@ -35,6 +35,9 @@ func wrapMtProtoWorkerPayloadTrace(
 	if conn == nil {
 		return conn
 	}
+
+	installMtProtoWorkerFrameTrace(conn, request, sessionID, workerDst)
+
 	return &mtProtoWorkerPayloadTraceConn{
 		Conn:      conn,
 		sessionID: strings.TrimSpace(sessionID),
