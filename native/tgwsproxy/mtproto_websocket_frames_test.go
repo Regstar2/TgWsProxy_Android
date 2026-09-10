@@ -12,10 +12,10 @@ import (
 )
 
 type frameTestConn struct {
-	reader    *bytes.Reader
-	writes    bytes.Buffer
-	closed    bool
-	maxWrite  int
+	reader     *bytes.Reader
+	writes     bytes.Buffer
+	closed     bool
+	maxWrite   int
 	writeCalls int
 }
 
@@ -201,28 +201,18 @@ func TestMtProtoSafeFrameSocketHandlesPingBetweenFragments(t *testing.T) {
 	}
 }
 
-func TestMtProtoSafeFrameSocketSplitsLargeOutboundWrite(t *testing.T) {
+func TestMtProtoSafeFrameSocketPreservesLargeOutboundWriteAsSingleMessage(t *testing.T) {
 	raw, conn := newFrameTestRaw(nil)
 	socket := &mtProtoSafeFrameSocket{raw: raw}
-	payload := bytes.Repeat([]byte{0x5A}, 2*mtProtoMaxOutboundWebSocketPayloadLen+123)
+	payload := bytes.Repeat([]byte{0x5A}, 65536)
 
 	if err := socket.Send(payload); err != nil {
 		t.Fatalf("send: %v", err)
 	}
 
 	lengths := clientFramePayloadLengths(t, conn.writes.Bytes())
-	want := []int{
-		mtProtoMaxOutboundWebSocketPayloadLen,
-		mtProtoMaxOutboundWebSocketPayloadLen,
-		123,
-	}
-	if len(lengths) != len(want) {
-		t.Fatalf("frame lengths=%v want=%v", lengths, want)
-	}
-	for i := range want {
-		if lengths[i] != want[i] {
-			t.Fatalf("frame lengths=%v want=%v", lengths, want)
-		}
+	if len(lengths) != 1 || lengths[0] != len(payload) {
+		t.Fatalf("frame lengths=%v want=[%d]", lengths, len(payload))
 	}
 }
 
