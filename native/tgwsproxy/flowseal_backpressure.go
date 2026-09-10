@@ -7,40 +7,30 @@ import (
 )
 
 const (
-	flowsealBulkFrameMinBytes            = 64 * 1024
-	flowsealBackpressurePollInterval     = 5 * time.Millisecond
-	flowsealBackpressureProgressInterval = 10 * time.Second
+	flowsealBulkFrameMinBytes        = 64 * 1024
+	flowsealDrainHighWaterBytes      = 64 * 1024
+	flowsealDrainLowWaterBytes       = 16 * 1024
+	flowsealDrainPollInterval        = 5 * time.Millisecond
+	flowsealDrainProgressInterval    = 10 * time.Second
 )
 
-// flowsealBackpressureQueueLimit returns the high-water mark used for data
-// which has not yet left the local TCP sender. Linux reports SO_SNDBUF as twice
-// the value requested by setsockopt, so half of the observed value corresponds
-// to the 256 KiB buffer requested by Flowseal-compatible socket setup.
-func flowsealBackpressureQueueLimit(sendBufferBytes int) int {
-	if sendBufferBytes <= 0 {
-		return -1
-	}
-	return sendBufferBytes / 2
+func shouldFlowsealDrain(frameBytes, queueBytes int) bool {
+	return frameBytes >= flowsealBulkFrameMinBytes && queueBytes > flowsealDrainHighWaterBytes
 }
 
-func shouldFlowsealBackpressure(frameBytes, notSentBytes, sendBufferBytes int) bool {
-	if frameBytes < flowsealBulkFrameMinBytes || notSentBytes < 0 {
-		return false
-	}
-	limit := flowsealBackpressureQueueLimit(sendBufferBytes)
-	return limit >= 0 && notSentBytes > limit
-}
-
-// waitFlowsealBackpressure applies pressure only to bytes which TCP has not
-// sent yet (SIOCOUTQNSD). TIOCOUTQ includes sent-but-unacknowledged data and is
-// retained only for diagnostics; waiting on that total queue caused #29 test
-// sessions to be terminated even when the local sender had already handed data
-// to the network.
+// drainFlowsealAfterWrite approximates the point at which Flowseal's
+// asyncio StreamWriter.write(frame); await writer.drain() applies flow control.
 //
-// There is deliberately no synthetic timeout here. If genuine not-sent data
-// remains above the high-water mark, keep applying backpressure until the
-// queue drains or the WebSocket is closed by the real network/read path.
-func waitFlowsealBackpressure(
+// CPython's default transport write-buffer watermarks are 64 KiB high and
+// 16 KiB low. Android exposes TIOCOUTQ reliably while SIOCOUTQNSD is not
+// available on the tested device, so this deliberately uses the total TCP
+// outstanding queue as a conservative pacing signal. The important semantic
+// difference from the previous #29 experiment is that pacing happens AFTER a
+// completed WebSocket frame, matching Flowseal's write-then-drain order.
+//
+// There is no synthetic timeout. If the peer stops making progress, the real
+// read/network path closes the WebSocket and wakes this loop through closed().
+func drainFlowsealAfterWrite(
 	conn net.Conn,
 	closed func() bool,
 	sessionID string,
@@ -48,40 +38,55 @@ func waitFlowsealBackpressure(
 	payloadBytes int,
 	frameBytes int,
 ) error {
-	sendBufferBytes := tcpSendBufferBytes(conn)
-	notSentBytes := tcpNotSentBytes(conn)
-	if !shouldFlowsealBackpressure(frameBytes, notSentBytes, sendBufferBytes) {
+	queueBytes := tcpSendQueueBytes(conn)
+	if !shouldFlowsealDrain(frameBytes, queueBytes) {
 		return nil
 	}
 
-	limit := flowsealBackpressureQueueLimit(sendBufferBytes)
 	started := time.Now()
 	lastProgressLog := started
 	if logInfo != nil {
 		logInfo.Printf(
-			"MTProto Worker Flowseal parity backpressure wait start session_id=%s seq=%d payload_bytes=%d frame_bytes=%d tcp_not_sent=%d tcp_not_sent_limit=%d tcp_send_queue=%d tcp_send_buffer_bytes=%d",
-			sessionID, sequence, payloadBytes, frameBytes, notSentBytes, limit, tcpSendQueueBytes(conn), sendBufferBytes,
+			"MTProto Worker Flowseal parity drain wait start session_id=%s seq=%d payload_bytes=%d frame_bytes=%d tcp_send_queue=%d drain_high_water=%d drain_low_water=%d tcp_not_sent=%d tcp_send_buffer_bytes=%d",
+			sessionID,
+			sequence,
+			payloadBytes,
+			frameBytes,
+			queueBytes,
+			flowsealDrainHighWaterBytes,
+			flowsealDrainLowWaterBytes,
+			tcpNotSentBytes(conn),
+			tcpSendBufferBytes(conn),
 		)
 	}
 
-	for notSentBytes > limit {
+	for queueBytes > flowsealDrainLowWaterBytes {
 		if closed != nil && closed() {
-			return fmt.Errorf("WebSocket closed while waiting for Worker TCP not-sent queue to drain")
+			return fmt.Errorf("WebSocket closed while waiting for Flowseal-style drain")
 		}
 
-		time.Sleep(flowsealBackpressurePollInterval)
-		notSentBytes = tcpNotSentBytes(conn)
-		if notSentBytes < 0 {
-			// Queue introspection is Linux/Android-specific. If it becomes
-			// unavailable, preserve the transport behavior instead of turning a
-			// diagnostic capability failure into a connection failure.
+		time.Sleep(flowsealDrainPollInterval)
+		queueBytes = tcpSendQueueBytes(conn)
+		if queueBytes < 0 {
+			// TIOCOUTQ is platform-specific. If introspection becomes unavailable,
+			// preserve transport behavior instead of turning diagnostics into a
+			// connection failure.
 			return nil
 		}
 
-		if logInfo != nil && time.Since(lastProgressLog) >= flowsealBackpressureProgressInterval {
+		if logInfo != nil && time.Since(lastProgressLog) >= flowsealDrainProgressInterval {
 			logInfo.Printf(
-				"MTProto Worker Flowseal parity backpressure still waiting session_id=%s seq=%d payload_bytes=%d frame_bytes=%d wait_ms=%d tcp_not_sent=%d tcp_not_sent_limit=%d tcp_send_queue=%d tcp_send_buffer_bytes=%d",
-				sessionID, sequence, payloadBytes, frameBytes, time.Since(started).Milliseconds(), notSentBytes, limit, tcpSendQueueBytes(conn), sendBufferBytes,
+				"MTProto Worker Flowseal parity drain still waiting session_id=%s seq=%d payload_bytes=%d frame_bytes=%d wait_ms=%d tcp_send_queue=%d drain_high_water=%d drain_low_water=%d tcp_not_sent=%d tcp_send_buffer_bytes=%d",
+				sessionID,
+				sequence,
+				payloadBytes,
+				frameBytes,
+				time.Since(started).Milliseconds(),
+				queueBytes,
+				flowsealDrainHighWaterBytes,
+				flowsealDrainLowWaterBytes,
+				tcpNotSentBytes(conn),
+				tcpSendBufferBytes(conn),
 			)
 			lastProgressLog = time.Now()
 		}
@@ -89,8 +94,17 @@ func waitFlowsealBackpressure(
 
 	if logInfo != nil {
 		logInfo.Printf(
-			"MTProto Worker Flowseal parity backpressure wait end session_id=%s seq=%d payload_bytes=%d frame_bytes=%d wait_ms=%d tcp_not_sent=%d tcp_not_sent_limit=%d tcp_send_queue=%d tcp_send_buffer_bytes=%d",
-			sessionID, sequence, payloadBytes, frameBytes, time.Since(started).Milliseconds(), notSentBytes, limit, tcpSendQueueBytes(conn), sendBufferBytes,
+			"MTProto Worker Flowseal parity drain wait end session_id=%s seq=%d payload_bytes=%d frame_bytes=%d wait_ms=%d tcp_send_queue=%d drain_high_water=%d drain_low_water=%d tcp_not_sent=%d tcp_send_buffer_bytes=%d",
+			sessionID,
+			sequence,
+			payloadBytes,
+			frameBytes,
+			time.Since(started).Milliseconds(),
+			queueBytes,
+			flowsealDrainHighWaterBytes,
+			flowsealDrainLowWaterBytes,
+			tcpNotSentBytes(conn),
+			tcpSendBufferBytes(conn),
 		)
 	}
 	return nil
