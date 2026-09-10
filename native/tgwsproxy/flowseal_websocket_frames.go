@@ -9,6 +9,7 @@ import (
 	"net"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 const flowsealMaxWebSocketMessageLen = 16 * 1024 * 1024
@@ -18,6 +19,7 @@ const flowsealMaxWebSocketMessageLen = 16 * 1024 * 1024
 type flowsealRawWebSocket struct {
 	conn      net.Conn
 	reader    *bufio.Reader
+	sessionID string
 	writeMu   sync.Mutex
 	closed    atomic.Bool
 	frag      []byte
@@ -32,27 +34,66 @@ func (ws *flowsealRawWebSocket) Send(data []byte) error {
 		return fmt.Errorf("WebSocket closed")
 	}
 	frame := buildFlowsealFrame(opBinary, data, true)
-	ws.writeMu.Lock()
-	err := writeFlowsealFull(ws.conn, frame)
-	ws.writeMu.Unlock()
-	if err == nil {
-		ws.noteSend(len(data), len(frame))
-	}
-	return err
+	return ws.sendFrame(frame, len(data))
 }
 
 func (ws *flowsealRawWebSocket) SendBatch(parts [][]byte) error {
 	if ws == nil || ws.closed.Load() {
 		return fmt.Errorf("WebSocket closed")
 	}
-	ws.writeMu.Lock()
-	defer ws.writeMu.Unlock()
 	for _, part := range parts {
 		frame := buildFlowsealFrame(opBinary, part, true)
-		if err := writeFlowsealFull(ws.conn, frame); err != nil {
+		if err := ws.sendFrame(frame, len(part)); err != nil {
 			return err
 		}
-		ws.noteSend(len(part), len(frame))
+	}
+	return nil
+}
+
+func (ws *flowsealRawWebSocket) sendFrame(frame []byte, payloadBytes int) error {
+	if ws == nil || ws.closed.Load() {
+		return fmt.Errorf("WebSocket closed")
+	}
+
+	// Allocate the sequence before entering the potentially blocking transport
+	// write. The #29 stall happens on the next frame after the last successful
+	// 64 KiB message, so post-write sequence allocation would hide the exact
+	// blocked attempt from diagnostics.
+	sequence := ws.sendCount.Add(1)
+	trace := payloadBytes >= 64*1024 || sequence <= 2
+
+	ws.writeMu.Lock()
+	defer ws.writeMu.Unlock()
+
+	queueBefore := tcpSendQueueBytes(ws.conn)
+	sendBufferBytes := tcpSendBufferBytes(ws.conn)
+	started := time.Now()
+	if logInfo != nil && trace {
+		logInfo.Printf(
+			"MTProto Worker Flowseal parity WS write start session_id=%s seq=%d payload_bytes=%d frame_bytes=%d tcp_send_queue_before=%d tcp_send_buffer_bytes=%d",
+			ws.logSessionID(), sequence, payloadBytes, len(frame), queueBefore, sendBufferBytes,
+		)
+	}
+
+	writtenFrameBytes, err := writeFlowsealFullCount(ws.conn, frame)
+	duration := time.Since(started)
+	queueAfter := tcpSendQueueBytes(ws.conn)
+	if err != nil {
+		if logInfo != nil {
+			logInfo.Printf(
+				"MTProto Worker Flowseal parity WS write failed session_id=%s seq=%d payload_bytes=%d frame_bytes=%d written_frame_bytes=%d duration_ms=%d tcp_send_queue_before=%d tcp_send_queue_after=%d tcp_send_buffer_bytes=%d error=%v",
+				ws.logSessionID(), sequence, payloadBytes, len(frame), writtenFrameBytes, duration.Milliseconds(), queueBefore, queueAfter, sendBufferBytes, err,
+			)
+		}
+		return err
+	}
+
+	cumulative := ws.sentBytes.Add(uint64(payloadBytes))
+	if logInfo != nil && trace {
+		logInfo.Printf(
+			"MTProto Worker Flowseal parity WS send session_id=%s seq=%d payload_bytes=%d frame_bytes=%d written_frame_bytes=%d cumulative_payload_bytes=%d duration_ms=%d tcp_send_queue_before=%d tcp_send_queue_after=%d tcp_send_buffer_bytes=%d",
+			ws.logSessionID(), sequence, payloadBytes, len(frame), writtenFrameBytes, cumulative, duration.Milliseconds(), queueBefore, queueAfter, sendBufferBytes,
+		)
 	}
 	return nil
 }
@@ -207,35 +248,62 @@ func buildFlowsealFrame(opcode int, payload []byte, mask bool) []byte {
 }
 
 func writeFlowsealFull(writer io.Writer, data []byte) error {
+	_, err := writeFlowsealFullCount(writer, data)
+	return err
+}
+
+func writeFlowsealFullCount(writer io.Writer, data []byte) (int, error) {
+	total := 0
 	for len(data) > 0 {
 		written, err := writer.Write(data)
 		if written > 0 {
+			total += written
 			data = data[written:]
 		}
 		if err != nil {
-			return err
+			return total, err
 		}
 		if written == 0 {
-			return io.ErrShortWrite
+			return total, io.ErrShortWrite
 		}
 	}
-	return nil
-}
-
-func (ws *flowsealRawWebSocket) noteSend(payloadBytes, frameBytes int) {
-	sequence := ws.sendCount.Add(1)
-	cumulative := ws.sentBytes.Add(uint64(payloadBytes))
-	if logInfo != nil && (payloadBytes >= 64*1024 || sequence <= 2) {
-		logInfo.Printf("MTProto Worker Flowseal parity WS send seq=%d payload_bytes=%d frame_bytes=%d cumulative_payload_bytes=%d", sequence, payloadBytes, frameBytes, cumulative)
-	}
+	return total, nil
 }
 
 func (ws *flowsealRawWebSocket) noteRecv(payloadBytes int) {
 	sequence := ws.recvCount.Add(1)
 	cumulative := ws.recvBytes.Add(uint64(payloadBytes))
 	if logInfo != nil && (payloadBytes >= 64*1024 || sequence <= 2) {
-		logInfo.Printf("MTProto Worker Flowseal parity WS recv seq=%d payload_bytes=%d cumulative_payload_bytes=%d", sequence, payloadBytes, cumulative)
+		logInfo.Printf(
+			"MTProto Worker Flowseal parity WS recv session_id=%s seq=%d payload_bytes=%d cumulative_payload_bytes=%d",
+			ws.logSessionID(), sequence, payloadBytes, cumulative,
+		)
 	}
+}
+
+func (ws *flowsealRawWebSocket) logSessionID() string {
+	if ws == nil || ws.sessionID == "" {
+		return "none"
+	}
+	return mtProtoStatusField(ws.sessionID)
+}
+
+func underlyingTCPConn(conn net.Conn) *net.TCPConn {
+	for conn != nil {
+		if tcpConn, ok := conn.(*net.TCPConn); ok {
+			return tcpConn
+		}
+		netConnProvider, ok := conn.(interface{ NetConn() net.Conn })
+		if !ok {
+			return nil
+		}
+		next := netConnProvider.NetConn()
+		if next == conn {
+			return nil
+		}
+		conn = next
+	}
+	return nil
 }
 
 var _ mtProtoFrameSocket = (*flowsealRawWebSocket)(nil)
