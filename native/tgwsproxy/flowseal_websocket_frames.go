@@ -20,6 +20,7 @@ type flowsealRawWebSocket struct {
 	conn      net.Conn
 	reader    *bufio.Reader
 	sessionID string
+	sendMu    sync.Mutex
 	writeMu   sync.Mutex
 	closed    atomic.Bool
 	frag      []byte
@@ -55,15 +56,19 @@ func (ws *flowsealRawWebSocket) sendFrame(frame []byte, payloadBytes int) error 
 		return fmt.Errorf("WebSocket closed")
 	}
 
+	// Keep application data frames ordered while allowing control frames from
+	// the receive loop to use writeMu during a backpressure wait. This more
+	// closely matches Flowseal's asyncio behavior, where await writer.drain()
+	// yields without preventing the recv task from replying to ping frames.
+	ws.sendMu.Lock()
+	defer ws.sendMu.Unlock()
+
 	// Allocate the sequence before entering the potentially blocking transport
 	// write. The #29 stall happens on the next frame after the last successful
 	// 64 KiB message, so post-write sequence allocation would hide the exact
 	// blocked attempt from diagnostics.
 	sequence := ws.sendCount.Add(1)
 	trace := payloadBytes >= 64*1024 || sequence <= 2
-
-	ws.writeMu.Lock()
-	defer ws.writeMu.Unlock()
 
 	if err := waitFlowsealBackpressure(
 		ws.conn,
@@ -75,6 +80,9 @@ func (ws *flowsealRawWebSocket) sendFrame(frame []byte, payloadBytes int) error 
 	); err != nil {
 		return err
 	}
+
+	ws.writeMu.Lock()
+	defer ws.writeMu.Unlock()
 
 	queueBefore := tcpSendQueueBytes(ws.conn)
 	sendBufferBytes := tcpSendBufferBytes(ws.conn)
