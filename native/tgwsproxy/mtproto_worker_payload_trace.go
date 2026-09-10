@@ -36,6 +36,11 @@ func wrapMtProtoWorkerPayloadTrace(
 		return conn
 	}
 
+	// Keep the WebSocket frame trace above the diagnostic transport pacing
+	// layer. That way the frame trace still observes one complete serialized
+	// WebSocket frame, while the transport layer can vary how that frame is
+	// handed to crypto/tls without changing WebSocket message boundaries.
+	installMtProtoWorkerTransportWrite(conn, request, sessionID, workerDst)
 	installMtProtoWorkerFrameTrace(conn, request, sessionID, workerDst)
 
 	return &mtProtoWorkerPayloadTraceConn{

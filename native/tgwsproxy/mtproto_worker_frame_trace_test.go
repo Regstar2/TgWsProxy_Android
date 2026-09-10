@@ -9,7 +9,7 @@ import (
 	"tg-ws-proxy/mtproxyfrontend"
 )
 
-func TestMtProtoWorkerFrameTraceReportsFragmentedLargeMessage(t *testing.T) {
+func TestMtProtoWorkerFrameTraceReportsSingleLargeFrame(t *testing.T) {
 	previousLogInfo := logInfo
 	var logs bytes.Buffer
 	logInfo = log.New(&logs, "", 0)
@@ -21,33 +21,27 @@ func TestMtProtoWorkerFrameTraceReportsFragmentedLargeMessage(t *testing.T) {
 	request := mtproxyfrontend.OutboundRequest{DCID: 2, SignedDC: 2, IsMedia: false}
 	installMtProtoWorkerFrameTrace(stream, request, "frame-session", "149.154.167.51")
 
-	payload := bytes.Repeat([]byte{0x5A}, mtProtoOutboundFragmentThreshold)
+	payload := bytes.Repeat([]byte{0x5A}, 65536)
 	if err := safeSocket.Send(payload); err != nil {
 		t.Fatalf("send: %v", err)
 	}
 
 	text := logs.String()
-	if got := strings.Count(text, "MTProto Worker WS frame trace"); got != 4 {
-		t.Fatalf("frame traces=%d want=4\n%s", got, text)
+	if got := strings.Count(text, "MTProto Worker WS frame trace"); got != 1 {
+		t.Fatalf("frame traces=%d want=1\n%s", got, text)
 	}
 	for _, want := range []string{
 		"session_id=frame-session",
 		"signed_dc=2 dc=2 media=false",
 		"worker_dst=149.154.167.51",
-		"frame_index=1 opcode=2 frame_payload_bytes=16384 frame_bytes=16392",
-		"frame_index=2 opcode=0 frame_payload_bytes=16384 frame_bytes=16392",
-		"frame_index=3 opcode=0 frame_payload_bytes=16384 frame_bytes=16392",
-		"frame_index=4 opcode=0 frame_payload_bytes=16384 frame_bytes=16392",
-		"requested_bytes=16392 written_bytes=16392",
+		"frame_index=1 opcode=2 frame_payload_bytes=65536 frame_bytes=65550",
+		"requested_bytes=65550 written_bytes=65550",
 		"completed=true short_write=false",
 		"result=ok error=none",
 	} {
 		if !strings.Contains(text, want) {
 			t.Fatalf("missing %q in trace:\n%s", want, text)
 		}
-	}
-	if strings.Contains(text, "frame_payload_bytes=65536") {
-		t.Fatalf("64 KiB payload must not be emitted as one WebSocket frame:\n%s", text)
 	}
 }
 

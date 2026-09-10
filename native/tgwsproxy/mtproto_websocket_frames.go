@@ -11,17 +11,6 @@ import (
 // fragmented message before it is exposed to the MTProto stream.
 const mtProtoMaxWebSocketMessageLen = 16 * 1024 * 1024
 
-// Android consistently delivers bulk MTProto traffic to the bridge in exact
-// 64 KiB reads. Sending such a read as one WebSocket frame makes Cloudflare
-// stop draining the connection in the failing #29 trace. Keep the WebSocket
-// message boundary intact, but fragment only messages that reach that
-// threshold into RFC 6455 continuation frames. The Worker still receives one
-// message event and therefore performs one TCP write to the Telegram DC.
-const (
-	mtProtoOutboundFragmentThreshold  = 64 * 1024
-	mtProtoOutboundFragmentPayloadLen = 16 * 1024
-)
-
 // mtProtoSafeFrameSocket adds bounded WebSocket message reassembly to the
 // existing RawWebSocket without changing the Android-specific transport,
 // routing, cooldown, watchdog or diagnostics code around it.
@@ -53,10 +42,11 @@ func (s *mtProtoSafeFrameSocket) Send(data []byte) error {
 	if s == nil || s.raw == nil {
 		return fmt.Errorf("WebSocket closed")
 	}
-	if len(data) < mtProtoOutboundFragmentThreshold {
-		return s.writeFrameFull(opBinary, data)
-	}
-	return s.writeMessageFragmented(data)
+	// Preserve the working protocol behaviour: one MTProto bridge write maps to
+	// exactly one WebSocket message. The 16 KiB segmentation experiment broke
+	// normal Telegram connectivity because the Worker treats WebSocket message
+	// boundaries as write boundaries to the Telegram DC.
+	return s.writeFrameFull(opBinary, data)
 }
 
 func (s *mtProtoSafeFrameSocket) SendBatch(parts [][]byte) error {
@@ -64,42 +54,6 @@ func (s *mtProtoSafeFrameSocket) SendBatch(parts [][]byte) error {
 		if err := s.Send(part); err != nil {
 			return err
 		}
-	}
-	return nil
-}
-
-// writeMessageFragmented preserves one logical WebSocket message while
-// avoiding a single frame with a 64-bit payload-length field. The first frame
-// is binary with FIN=0, middle frames are continuation frames with FIN=0, and
-// the final continuation frame has FIN=1. Each frame is independently masked
-// as required for client-to-server WebSocket traffic.
-func (s *mtProtoSafeFrameSocket) writeMessageFragmented(payload []byte) error {
-	if s.raw.closed.Load() {
-		return fmt.Errorf("WebSocket closed")
-	}
-
-	s.raw.writeMu.Lock()
-	defer s.raw.writeMu.Unlock()
-
-	for offset := 0; offset < len(payload); {
-		end := offset + mtProtoOutboundFragmentPayloadLen
-		if end > len(payload) {
-			end = len(payload)
-		}
-
-		opcode := opContinuation
-		if offset == 0 {
-			opcode = opBinary
-		}
-		fin := end == len(payload)
-		frame := s.raw.buildFrame(opcode, payload[offset:end], true)
-		if !fin {
-			frame[0] &^= 0x80
-		}
-		if err := writeFull(s.raw.conn, frame); err != nil {
-			return err
-		}
-		offset = end
 	}
 	return nil
 }
