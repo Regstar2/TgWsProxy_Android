@@ -11,14 +11,6 @@ import (
 // fragmented message before it is exposed to the MTProto stream.
 const mtProtoMaxWebSocketMessageLen = 16 * 1024 * 1024
 
-// mtProtoMaxOutboundWebSocketPayloadLen deliberately keeps each outbound
-// WebSocket message below the 64 KiB reads produced by the MTProto bridge.
-// Real-device diagnostics for #29 showed repeated 64 KiB Worker messages with
-// no downstream response, followed by Cloudflare write timeouts. Splitting the
-// byte stream into smaller WebSocket messages preserves TCP stream semantics at
-// the Worker while adding backpressure between writes.
-const mtProtoMaxOutboundWebSocketPayloadLen = 16 * 1024
-
 // mtProtoSafeFrameSocket adds bounded WebSocket message reassembly to the
 // existing RawWebSocket without changing the Android-specific transport,
 // routing, cooldown, watchdog or diagnostics code around it.
@@ -50,21 +42,11 @@ func (s *mtProtoSafeFrameSocket) Send(data []byte) error {
 	if s == nil || s.raw == nil {
 		return fmt.Errorf("WebSocket closed")
 	}
-	if len(data) == 0 {
-		return s.writeFrameFull(opBinary, nil)
-	}
-
-	for len(data) > 0 {
-		chunkLen := len(data)
-		if chunkLen > mtProtoMaxOutboundWebSocketPayloadLen {
-			chunkLen = mtProtoMaxOutboundWebSocketPayloadLen
-		}
-		if err := s.writeFrameFull(opBinary, data[:chunkLen]); err != nil {
-			return err
-		}
-		data = data[chunkLen:]
-	}
-	return nil
+	// Preserve the working protocol behaviour: one MTProto bridge write maps to
+	// exactly one WebSocket message. The 16 KiB segmentation experiment broke
+	// normal Telegram connectivity because the Worker treats WebSocket message
+	// boundaries as write boundaries to the Telegram DC.
+	return s.writeFrameFull(opBinary, data)
 }
 
 func (s *mtProtoSafeFrameSocket) SendBatch(parts [][]byte) error {
@@ -86,9 +68,9 @@ func (s *mtProtoSafeFrameSocket) writeFrameFull(opcode int, payload []byte) erro
 	return writeFull(s.raw.conn, frame)
 }
 
-// writeFull turns net.Conn.Write into the same all-bytes-or-error contract that
-// Flowseal gets from StreamWriter.write()+drain(). A short successful Write is
-// legal for io.Writer and must not silently truncate a WebSocket frame.
+// writeFull gives a WebSocket frame an all-bytes-or-error write contract. A
+// short successful net.Conn.Write is legal and must not silently truncate a
+// frame; the loop also lets the frame-level diagnostic identify such writes.
 func writeFull(writer io.Writer, data []byte) error {
 	for len(data) > 0 {
 		n, err := writer.Write(data)
