@@ -8,6 +8,10 @@ func tcpSendQueueBytes(net.Conn) int {
 	return -1
 }
 
+func tcpNotSentBytes(net.Conn) int {
+	return -1
+}
+
 func tcpSendBufferBytes(net.Conn) int {
 	return -1
 }
