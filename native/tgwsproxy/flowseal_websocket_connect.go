@@ -7,6 +7,7 @@ import (
 	"encoding/base64"
 	"fmt"
 	"net"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -101,7 +102,11 @@ func connectFlowsealRawWebSocket(host, domain, path string, timeout float64) (*f
 		statusCode, _ = strconv.Atoi(parts[1])
 	}
 	if statusCode == 101 {
-		return &flowsealRawWebSocket{conn: tlsConn, reader: reader}, nil
+		return &flowsealRawWebSocket{
+			conn:      tlsConn,
+			reader:    reader,
+			sessionID: flowsealSessionIDFromPath(path),
+		}, nil
 	}
 
 	headers := make(map[string]string)
@@ -119,6 +124,14 @@ func connectFlowsealRawWebSocket(host, domain, path string, timeout float64) (*f
 		Headers:    headers,
 		Location:   headers["location"],
 	}
+}
+
+func flowsealSessionIDFromPath(path string) string {
+	parsed, err := url.ParseRequestURI(path)
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(parsed.Query().Get("sid"))
 }
 
 func buildFlowsealUpgradeRequest(path, domain, websocketKey string) string {
