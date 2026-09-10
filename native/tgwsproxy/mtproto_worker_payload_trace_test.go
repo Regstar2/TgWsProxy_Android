@@ -73,24 +73,58 @@ func TestMtProtoWorkerPayloadTraceLogsFirst16ChunksPerDirection(t *testing.T) {
 	}
 }
 
-func TestMtProtoWorkerPayloadTraceSkipsNonMediaAndPreservesDiagnostics(t *testing.T) {
+func TestMtProtoWorkerPayloadTraceIncludesNonMediaWorkerSessions(t *testing.T) {
+	previousLogInfo := logInfo
+	var logs bytes.Buffer
+	logInfo = log.New(&logs, "", 0)
+	t.Cleanup(func() { logInfo = previousLogInfo })
+
 	base := &mtProtoWebSocketStream{
-		socket:    &fakeMtProtoFrameSocket{},
+		socket:    &fakeMtProtoFrameSocket{recv: [][]byte{{0x42, 0x43}}},
 		sessionID: "underlying-session",
 		workerDst: "149.154.167.51",
 	}
-	nonMedia := mtproxyfrontend.OutboundRequest{DCID: 2, SignedDC: 2, IsMedia: false}
-	if got := wrapMtProtoWorkerPayloadTrace(base, nonMedia, "ignored", "ignored"); got != base {
-		t.Fatal("non-media Worker connection must not be wrapped")
+	request := mtproxyfrontend.OutboundRequest{DCID: 2, SignedDC: 2, IsMedia: false}
+	wrapped := wrapMtProtoWorkerPayloadTrace(base, request, "fallback-session", "149.154.167.51")
+	if wrapped == base {
+		t.Fatal("non-media Worker connection must be wrapped for diagnostic tracing")
 	}
 
-	media := mtproxyfrontend.OutboundRequest{DCID: 2, SignedDC: -2, IsMedia: true}
-	wrapped := wrapMtProtoWorkerPayloadTrace(base, media, "fallback-session", "149.154.167.220")
-	diagnostics := mtproxyfrontend.RouteDiagnosticsFor(wrapped, media)
+	if n, err := wrapped.Write([]byte{0x10, 0x20, 0x30}); err != nil || n != 3 {
+		t.Fatalf("write n=%d err=%v", n, err)
+	}
+	buf := make([]byte, 8)
+	if n, err := wrapped.Read(buf); err != nil || n != 2 {
+		t.Fatalf("read n=%d err=%v", n, err)
+	}
+
+	text := logs.String()
+	for _, want := range []string{
+		"session_id=fallback-session",
+		"signed_dc=2",
+		"dc=2",
+		"media=false",
+		"worker_dst=149.154.167.51",
+		"direction=client_to_worker chunk_index=1 bytes=3",
+		"direction=worker_to_client chunk_index=1 bytes=2",
+	} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("missing %q in trace:\n%s", want, text)
+		}
+	}
+
+	diagnostics := mtproxyfrontend.RouteDiagnosticsFor(wrapped, request)
 	if diagnostics.SessionID != "underlying-session" {
 		t.Fatalf("session id=%q", diagnostics.SessionID)
 	}
 	if diagnostics.WorkerDst != "149.154.167.51" {
 		t.Fatalf("worker dst=%q", diagnostics.WorkerDst)
+	}
+}
+
+func TestMtProtoWorkerPayloadTraceNilConnectionIsUnchanged(t *testing.T) {
+	request := mtproxyfrontend.OutboundRequest{DCID: 2, SignedDC: 2, IsMedia: false}
+	if got := wrapMtProtoWorkerPayloadTrace(nil, request, "session", "149.154.167.51"); got != nil {
+		t.Fatal("nil Worker connection must remain nil")
 	}
 }
