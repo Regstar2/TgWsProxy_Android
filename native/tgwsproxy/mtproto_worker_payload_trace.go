@@ -32,7 +32,7 @@ func wrapMtProtoWorkerPayloadTrace(
 	sessionID string,
 	workerDst string,
 ) net.Conn {
-	if conn == nil || !request.IsMedia {
+	if conn == nil {
 		return conn
 	}
 	return &mtProtoWorkerPayloadTraceConn{
