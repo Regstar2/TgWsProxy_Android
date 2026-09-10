@@ -123,6 +123,7 @@ func TestFlowsealParityWorkerConnectorBypassesPreconnectPool(t *testing.T) {
 	pool := newWorkerWsPool(&fakeWorkerDialer{})
 	workerPool = pool
 	t.Cleanup(func() {
+		waitWorkerPoolRefills(t, workerPool)
 		workerPool.CloseAll()
 		workerPool = previousPool
 	})

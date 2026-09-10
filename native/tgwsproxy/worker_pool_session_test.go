@@ -11,6 +11,10 @@ func TestWorkerPoolSessionMissDoesNotScheduleDuplicateRefill(t *testing.T) {
 	stats.Reset()
 	dialer := &fakeWorkerDialer{}
 	pool := newWorkerWsPool(dialer)
+	t.Cleanup(func() {
+		waitWorkerPoolRefills(t, pool)
+		pool.CloseAll()
+	})
 
 	if got := pool.GetForSession(testWorkerKey()); got != nil {
 		t.Fatal("first session get should miss")
@@ -31,6 +35,10 @@ func TestWorkerPoolSessionHitSchedulesReplacementRefill(t *testing.T) {
 	stats.Reset()
 	dialer := &fakeWorkerDialer{}
 	pool := newWorkerWsPool(dialer)
+	t.Cleanup(func() {
+		waitWorkerPoolRefills(t, pool)
+		pool.CloseAll()
+	})
 	key := testWorkerKey()
 	pooled := newFakeWebSocket()
 	pool.idle[key] = []poolEntry{{ws: pooled, created: pool.now()}}
@@ -55,6 +63,10 @@ func TestWorkerPoolSessionDoesNotCrossEffectiveMediaOrDestination(t *testing.T) 
 	withPoolSize(t, 1)
 	stats.Reset()
 	pool := newWorkerWsPool(&fakeWorkerDialer{})
+	t.Cleanup(func() {
+		waitWorkerPoolRefills(t, pool)
+		pool.CloseAll()
+	})
 	normalKey := testWorkerKey()
 	pooled := newFakeWebSocket()
 	pool.idle[normalKey] = []poolEntry{{ws: pooled, created: pool.now()}}

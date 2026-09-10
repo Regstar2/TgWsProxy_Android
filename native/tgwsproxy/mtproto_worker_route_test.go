@@ -159,6 +159,7 @@ func TestMtProtoWorkerConnectorUsesPreconnectedWorkerWhenMtProtoEnabled(t *testi
 	pool := newWorkerWsPool(&fakeWorkerDialer{})
 	workerPool = pool
 	t.Cleanup(func() {
+		waitWorkerPoolRefills(t, workerPool)
 		workerPool.CloseAll()
 		workerPool = previousPool
 	})
@@ -212,6 +213,7 @@ func TestMtProtoWorkerConnectorMediaPoolMissUsesFreshDial(t *testing.T) {
 	backgroundDialer := &fakeWorkerDialer{}
 	workerPool = newWorkerWsPool(backgroundDialer)
 	t.Cleanup(func() {
+		waitWorkerPoolRefills(t, workerPool)
 		workerPool.CloseAll()
 		workerPool = previousPool
 	})

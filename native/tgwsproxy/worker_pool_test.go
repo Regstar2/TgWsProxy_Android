@@ -83,6 +83,10 @@ func TestWorkerPoolGetMissSchedulesRefill(t *testing.T) {
 	stats.Reset()
 	dialer := &fakeWorkerDialer{}
 	pool := newWorkerWsPool(dialer)
+	t.Cleanup(func() {
+		waitWorkerPoolRefills(t, pool)
+		pool.CloseAll()
+	})
 
 	if got := pool.Get(testWorkerKey()); got != nil {
 		t.Fatal("first get should miss")
@@ -103,6 +107,10 @@ func TestWorkerPoolHitReusesIdleConnection(t *testing.T) {
 	withPoolSize(t, 1)
 	stats.Reset()
 	pool := newWorkerWsPool(&fakeWorkerDialer{})
+	t.Cleanup(func() {
+		waitWorkerPoolRefills(t, pool)
+		pool.CloseAll()
+	})
 	key := testWorkerKey()
 	ws := newFakeWebSocket()
 	pool.idle[key] = []poolEntry{{ws: ws, created: pool.now()}}
@@ -120,6 +128,10 @@ func TestWorkerPoolDropsExpiredConnection(t *testing.T) {
 	withPoolSize(t, 1)
 	stats.Reset()
 	pool := newWorkerWsPool(&fakeWorkerDialer{fail: true})
+	t.Cleanup(func() {
+		waitWorkerPoolRefills(t, pool)
+		pool.CloseAll()
+	})
 	pool.maxAge = 1
 	now := 10.0
 	pool.now = func() float64 { return now }
@@ -138,6 +150,10 @@ func TestWorkerPoolDropsExpiredConnection(t *testing.T) {
 
 func TestWorkerPoolResetClearsIdle(t *testing.T) {
 	pool := newWorkerWsPool(&fakeWorkerDialer{})
+	t.Cleanup(func() {
+		waitWorkerPoolRefills(t, pool)
+		pool.CloseAll()
+	})
 	key := testWorkerKey()
 	pool.idle[key] = []poolEntry{{ws: newFakeWebSocket(), created: pool.now()}}
 
@@ -152,6 +168,10 @@ func TestWorkerPoolDoesNotRefillWhenPoolSizeZero(t *testing.T) {
 	withPoolSize(t, 0)
 	dialer := &fakeWorkerDialer{}
 	pool := newWorkerWsPool(dialer)
+	t.Cleanup(func() {
+		waitWorkerPoolRefills(t, pool)
+		pool.CloseAll()
+	})
 
 	if got := pool.Get(testWorkerKey()); got != nil {
 		t.Fatal("pool disabled should return nil")
@@ -167,6 +187,10 @@ func TestWorkerPoolCapsPreconnectPerKey(t *testing.T) {
 	withPoolSize(t, 8)
 	dialer := &fakeWorkerDialer{}
 	pool := newWorkerWsPool(dialer)
+	t.Cleanup(func() {
+		waitWorkerPoolRefills(t, pool)
+		pool.CloseAll()
+	})
 
 	pool.refill(testWorkerKey())
 
@@ -185,6 +209,10 @@ func TestWorkerWsPreconnectDisabledByDefault(t *testing.T) {
 	withPoolSize(t, 1)
 	stats.Reset()
 	pool := newWorkerWsPool(&fakeWorkerDialer{})
+	t.Cleanup(func() {
+		waitWorkerPoolRefills(t, pool)
+		pool.CloseAll()
+	})
 	key := testWorkerKey()
 	pool.idle[key] = []poolEntry{{ws: newFakeWebSocket(), created: pool.now()}}
 
@@ -250,5 +278,24 @@ func TestWorkerWarmupKeysUseEffectiveDestinationAndExcludeMedia(t *testing.T) {
 	}
 	if !foundDC2 {
 		t.Fatalf("effective DC2 destination not warmed up: %+v", keys)
+	}
+}
+
+// Refill goroutines read global test settings. Join them before cleanup
+// restores those settings, otherwise the next test races with the old pool.
+func waitWorkerPoolRefills(t *testing.T, pool *WorkerWsPool) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		pool.mu.Lock()
+		active := len(pool.refilling)
+		pool.mu.Unlock()
+		if active == 0 {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("Worker pool refill did not finish before test cleanup")
+		}
+		time.Sleep(time.Millisecond)
 	}
 }
