@@ -112,7 +112,7 @@ func (c *mtProtoRouteConnector) Connect(
 		}
 		if logInfo != nil {
 			logInfo.Printf("MTProto route candidate failed route=%s selected_backend=%s reason=%s error=%v",
-				route, selectedBackend, mtProtoStatusField(result.Reason), lastErr)
+				route, selectedBackend, mtProtoStatusField(lastResult.Reason), lastErr)
 		}
 	}
 
@@ -293,7 +293,10 @@ func (c *mtProtoWorkerConnector) Connect(
 		return nil, result
 	}
 
-	sessionID := newWorkerSessionID()
+	// The frontend and Worker connector independently derive the same opaque
+	// identifier from relay_init, so every lifecycle log can be correlated
+	// without exposing relay key material or relying on log ordering.
+	sessionID := mtproxyfrontend.SessionIDForRequest(request)
 	var lastErr error
 	var lastReason string
 	for i := 0; i < maxAttempts; i++ {
@@ -307,7 +310,9 @@ func (c *mtProtoWorkerConnector) Connect(
 		)
 		if logInfo != nil {
 			logInfo.Printf(
-				"MTProto route truth frontend=MTProto selected_backend=%s actual_backend=none fallback_used=false reason=connecting dc=%d media=%t effective_dc=%d effective_media=%t transport=%s worker_host=%s worker_dst=%s destination_mode=%s effective_destination_mode=%s attempt=%d",
+				"MTProto route truth frontend=MTProto session_id=%s signed_dc=%d selected_backend=%s actual_backend=none fallback_used=false reason=connecting dc=%d media=%t effective_dc=%d effective_media=%t transport=%s worker_host=%s worker_dst=%s destination_mode=%s effective_destination_mode=%s attempt=%d",
+				sessionID,
+				request.SignedDC,
 				mtProtoWorkerBackend,
 				request.DCID,
 				request.IsMedia,
@@ -334,7 +339,9 @@ func (c *mtProtoWorkerConnector) Connect(
 			ws = pooled
 			if logInfo != nil {
 				logInfo.Printf(
-					"MTProto Worker WS preconnect hit dc=%d media=%t worker_host=%s worker_dst=%s attempt=%d",
+					"MTProto Worker WS preconnect hit session_id=%s signed_dc=%d dc=%d media=%t worker_host=%s worker_dst=%s attempt=%d",
+					sessionID,
+					request.SignedDC,
 					effectiveDC,
 					effectiveMedia,
 					candidate.Domain,
@@ -346,7 +353,9 @@ func (c *mtProtoWorkerConnector) Connect(
 			preconnectEnabled := workerWsPreconnectActive()
 			if logInfo != nil && preconnectEnabled {
 				logInfo.Printf(
-					"MTProto Worker WS preconnect miss dc=%d media=%t worker_host=%s worker_dst=%s attempt=%d",
+					"MTProto Worker WS preconnect miss session_id=%s signed_dc=%d dc=%d media=%t worker_host=%s worker_dst=%s attempt=%d",
+					sessionID,
+					request.SignedDC,
 					effectiveDC,
 					effectiveMedia,
 					candidate.Domain,
@@ -356,7 +365,9 @@ func (c *mtProtoWorkerConnector) Connect(
 			}
 			if logInfo != nil {
 				logInfo.Printf(
-					"MTProto Worker WS fresh dial dc=%d media=%t worker_host=%s worker_dst=%s preconnect_enabled=%t attempt=%d",
+					"MTProto Worker WS fresh dial session_id=%s signed_dc=%d dc=%d media=%t worker_host=%s worker_dst=%s preconnect_enabled=%t attempt=%d",
+					sessionID,
+					request.SignedDC,
 					effectiveDC,
 					effectiveMedia,
 					candidate.Domain,
@@ -383,6 +394,10 @@ func (c *mtProtoWorkerConnector) Connect(
 			}
 			continue
 		}
+		if workerStream, ok := stream.(*mtProtoWebSocketStream); ok {
+			workerStream.sessionID = sessionID
+			workerStream.workerDst = target
+		}
 
 		result.ActualBackend = mtProtoWorkerBackend
 		result.Reason = "connected"
@@ -406,14 +421,16 @@ func mtProtoWorkerConfigured() bool {
 }
 
 type mtProtoWebSocketStream struct {
-	socket   mtProtoFrameSocket
-	splitter *MsgSplitter
-	local    net.Addr
-	remote   net.Addr
-	readMu   sync.Mutex
-	readBuf  []byte
-	closeMu  sync.Mutex
-	closed   bool
+	socket    mtProtoFrameSocket
+	splitter  *MsgSplitter
+	local     net.Addr
+	remote    net.Addr
+	sessionID string
+	workerDst string
+	readMu    sync.Mutex
+	readBuf   []byte
+	closeMu   sync.Mutex
+	closed    bool
 }
 
 func (s *mtProtoWebSocketStream) Read(dst []byte) (int, error) {
@@ -494,6 +511,13 @@ func (s *mtProtoWebSocketStream) SetWriteDeadline(time.Time) error {
 	return nil
 }
 
+func (s *mtProtoWebSocketStream) RouteDiagnostics() mtproxyfrontend.RouteDiagnostics {
+	return mtproxyfrontend.RouteDiagnostics{
+		SessionID: strings.TrimSpace(s.sessionID),
+		WorkerDst: strings.TrimSpace(s.workerDst),
+	}
+}
+
 type mtProtoNetAddr string
 
 func (a mtProtoNetAddr) Network() string {
@@ -505,6 +529,7 @@ func (a mtProtoNetAddr) String() string {
 }
 
 var (
-	_ net.Conn  = (*mtProtoWebSocketStream)(nil)
-	_ io.Closer = (*mtProtoWebSocketStream)(nil)
+	_ net.Conn                                 = (*mtProtoWebSocketStream)(nil)
+	_ io.Closer                                = (*mtProtoWebSocketStream)(nil)
+	_ mtproxyfrontend.RouteDiagnosticsProvider = (*mtProtoWebSocketStream)(nil)
 )

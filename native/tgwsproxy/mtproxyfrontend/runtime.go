@@ -439,20 +439,30 @@ func (r *Runtime) handleConnection(ctx context.Context, conn net.Conn, config Co
 	if config.FakeTLSDomain != "" {
 		r.noteFakeTLSAccepted()
 	}
-	r.log("MTProto route request remote=%s signed_dc=%d dc=%d media=%t test_dc=%t transport=%s selected_backend=%s",
-		remote, request.SignedDC, request.DCID, request.IsMedia, request.IsTestDC, request.Transport, r.connector.Capability().SelectedBackend)
+
+	sessionID := SessionIDForRequest(request)
+	r.log("MTProto route request session_id=%s remote=%s signed_dc=%d dc=%d media=%t test_dc=%t transport=%s selected_backend=%s",
+		sessionID, remote, request.SignedDC, request.DCID, request.IsMedia, request.IsTestDC, request.Transport, r.connector.Capability().SelectedBackend)
 
 	outbound, result := r.connector.Connect(ctx, request)
 	r.updateRouteTruth(result)
 	if result.Err != nil || outbound == nil {
-		r.log("MTProto route failed frontend=MTProto selected_backend=%s actual_backend=%s fallback_used=%t reason=%s error=%v",
+		r.log("MTProto route failed frontend=MTProto session_id=%s signed_dc=%d dc=%d media=%t worker_dst=none selected_backend=%s actual_backend=%s fallback_used=%t reason=%s error=%v",
+			sessionID, request.SignedDC, request.DCID, request.IsMedia,
 			emptyStatusField(result.SelectedBackend), emptyStatusField(result.ActualBackend),
 			result.FallbackUsed, emptyStatusField(result.Reason), result.Err)
 		return
 	}
 	defer outbound.Close()
 
-	r.log("MTProto route connected frontend=MTProto selected_backend=%s actual_backend=%s fallback_used=%t reason=%s",
+	diagnostics := RouteDiagnosticsFor(outbound, request)
+	if diagnostics.SessionID != "" {
+		sessionID = diagnostics.SessionID
+	}
+	workerDst := emptyStatusField(diagnostics.WorkerDst)
+
+	r.log("MTProto route connected frontend=MTProto session_id=%s signed_dc=%d dc=%d media=%t worker_dst=%s selected_backend=%s actual_backend=%s fallback_used=%t reason=%s",
+		sessionID, request.SignedDC, request.DCID, request.IsMedia, workerDst,
 		result.SelectedBackend, result.ActualBackend, result.FallbackUsed, result.Reason)
 	bridge := bridgeTransformedStreams(ctx, clientConn, outbound, request.ClientToRelay, request.RelayToClient)
 	bridgeError := "none"
@@ -460,7 +470,12 @@ func (r *Runtime) handleConnection(ctx context.Context, conn net.Conn, config Co
 		bridgeError = sanitizeStatusField(bridge.Err.Error())
 	}
 	r.log(
-		"MTProto bridge closed frontend=MTProto selected_backend=%s actual_backend=%s fallback_used=%t first_terminator=%s close_reason=%s up_bytes=%d down_bytes=%d up_chunks=%d down_chunks=%d duration_ms=%d error=%s",
+		"MTProto bridge closed frontend=MTProto session_id=%s signed_dc=%d dc=%d media=%t worker_dst=%s selected_backend=%s actual_backend=%s fallback_used=%t first_terminator=%s close_reason=%s up_bytes=%d down_bytes=%d up_chunks=%d down_chunks=%d duration_ms=%d error=%s",
+		sessionID,
+		request.SignedDC,
+		request.DCID,
+		request.IsMedia,
+		workerDst,
 		result.SelectedBackend,
 		result.ActualBackend,
 		result.FallbackUsed,
