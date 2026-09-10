@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"errors"
 	"strings"
 	"testing"
 
@@ -28,9 +29,34 @@ func TestFlowsealUpgradeRequestMatchesUpstreamHeaders(t *testing.T) {
 	}
 }
 
+func TestFlowsealSessionIDFromPath(t *testing.T) {
+	path := "/apiws?dc=2&dst=149.154.167.51&media=0&sid=8979e0876fa35d85"
+	if got, want := flowsealSessionIDFromPath(path), "8979e0876fa35d85"; got != want {
+		t.Fatalf("session id=%q want=%q", got, want)
+	}
+	if got := flowsealSessionIDFromPath("/apiws?dc=2"); got != "" {
+		t.Fatalf("missing session id=%q want empty", got)
+	}
+}
+
+func TestWriteFlowsealFullCountReportsPartialWriteBeforeFailure(t *testing.T) {
+	writer := &flowsealFailingWriter{maxWrite: 7, failAfter: 11}
+	written, err := writeFlowsealFullCount(writer, bytes.Repeat([]byte{0xA5}, 32))
+	if !errors.Is(err, errFlowsealTestWrite) {
+		t.Fatalf("error=%v want=%v", err, errFlowsealTestWrite)
+	}
+	if got, want := written, 11; got != want {
+		t.Fatalf("written bytes=%d want=%d", got, want)
+	}
+}
+
 func TestFlowsealRawWebSocketKeeps65536BytesInOneMessage(t *testing.T) {
 	conn := &frameTestConn{reader: bytes.NewReader(nil), maxWrite: 16 * 1024}
-	ws := &flowsealRawWebSocket{conn: conn, reader: bufio.NewReader(conn)}
+	ws := &flowsealRawWebSocket{
+		conn:      conn,
+		reader:    bufio.NewReader(conn),
+		sessionID: "diagnostic-session",
+	}
 	payload := bytes.Repeat([]byte{0x5A}, 65536)
 
 	if err := ws.Send(payload); err != nil {
@@ -46,6 +72,12 @@ func TestFlowsealRawWebSocketKeeps65536BytesInOneMessage(t *testing.T) {
 	if conn.writeCalls <= 1 {
 		t.Fatalf("write calls=%d want multiple transport writes for the short-write fixture", conn.writeCalls)
 	}
+	if got := ws.sendCount.Load(); got != 1 {
+		t.Fatalf("send attempt count=%d want=1", got)
+	}
+	if got := ws.sentBytes.Load(); got != uint64(len(payload)) {
+		t.Fatalf("successful payload bytes=%d want=%d", got, len(payload))
+	}
 }
 
 func TestFlowsealRawWebSocketReassemblesFragmentedServerMessage(t *testing.T) {
@@ -56,7 +88,7 @@ func TestFlowsealRawWebSocketReassemblesFragmentedServerMessage(t *testing.T) {
 		testServerFrame(opContinuation, []byte("CCC"), true),
 	}, nil)
 	conn := &frameTestConn{reader: bytes.NewReader(input)}
-	ws := &flowsealRawWebSocket{conn: conn, reader: bufio.NewReader(conn)}
+	ws := &flowsealRawWebSocket{conn: conn, reader: bufio.NewReader(conn), sessionID: "recv-session"}
 
 	message, err := ws.Recv()
 	if err != nil {
@@ -131,4 +163,31 @@ func TestFlowsealParityWorkerConnectorBypassesPreconnectPool(t *testing.T) {
 	if got := stats.workerWsPreconnectHits.Load(); got != 0 {
 		t.Fatalf("preconnect hits=%d want=0 in Flowseal parity mode", got)
 	}
+}
+
+var errFlowsealTestWrite = errors.New("test transport write failure")
+
+type flowsealFailingWriter struct {
+	maxWrite  int
+	failAfter int
+	written   int
+}
+
+func (w *flowsealFailingWriter) Write(p []byte) (int, error) {
+	if w.written >= w.failAfter {
+		return 0, errFlowsealTestWrite
+	}
+	remainingBeforeFailure := w.failAfter - w.written
+	n := len(p)
+	if w.maxWrite > 0 && n > w.maxWrite {
+		n = w.maxWrite
+	}
+	if n > remainingBeforeFailure {
+		n = remainingBeforeFailure
+	}
+	w.written += n
+	if w.written >= w.failAfter {
+		return n, errFlowsealTestWrite
+	}
+	return n, nil
 }
