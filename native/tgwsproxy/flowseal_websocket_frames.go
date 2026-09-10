@@ -12,7 +12,11 @@ import (
 	"time"
 )
 
-const flowsealMaxWebSocketMessageLen = 16 * 1024 * 1024
+const (
+	flowsealMaxWebSocketMessageLen       = 16 * 1024 * 1024
+	flowsealDiagnosticPayloadBoundary    = 64 * 1024
+	flowsealDiagnosticFirstFragmentBytes = 64*1024 - 1
+)
 
 // flowsealRawWebSocket mirrors Flowseal's RawWebSocket message semantics and
 // intentionally stays separate from the Android RawWebSocket abstraction.
@@ -34,6 +38,12 @@ func (ws *flowsealRawWebSocket) Send(data []byte) error {
 	if ws == nil || ws.closed.Load() {
 		return fmt.Errorf("WebSocket closed")
 	}
+	if len(data) == flowsealDiagnosticPayloadBoundary && logInfo != nil {
+		logInfo.Printf(
+			"MTProto Worker Flowseal diagnostic fragment session_id=%s payload_bytes=%d first_fragment_bytes=%d final_fragment_bytes=%d reason=probe_rfc6455_length_127",
+			ws.logSessionID(), len(data), flowsealDiagnosticFirstFragmentBytes, len(data)-flowsealDiagnosticFirstFragmentBytes,
+		)
+	}
 	frame := buildFlowsealFrame(opBinary, data, true)
 	return ws.sendFrame(frame, len(data))
 }
@@ -43,8 +53,7 @@ func (ws *flowsealRawWebSocket) SendBatch(parts [][]byte) error {
 		return fmt.Errorf("WebSocket closed")
 	}
 	for _, part := range parts {
-		frame := buildFlowsealFrame(opBinary, part, true)
-		if err := ws.sendFrame(frame, len(part)); err != nil {
+		if err := ws.Send(part); err != nil {
 			return err
 		}
 	}
@@ -56,17 +65,13 @@ func (ws *flowsealRawWebSocket) sendFrame(frame []byte, payloadBytes int) error 
 		return fmt.Errorf("WebSocket closed")
 	}
 
-	// Keep application data frames ordered. The send mutex intentionally stays
-	// held across the post-write drain so the next data frame cannot outrun the
-	// Flowseal-style high/low watermarks. Control frames use writeMu only and can
-	// still be emitted while this goroutine is waiting for the queue to drain.
+	// Keep application data messages ordered. Control frames use writeMu only,
+	// so the receive loop can still answer ping/close independently.
 	ws.sendMu.Lock()
 	defer ws.sendMu.Unlock()
 
 	// Allocate the sequence before entering the potentially blocking transport
-	// write. The #29 stall happens on the next frame after the last successful
-	// 64 KiB message, so post-write sequence allocation would hide the exact
-	// blocked attempt from diagnostics.
+	// write. This keeps the exact blocked attempt visible in #29 diagnostics.
 	sequence := ws.sendCount.Add(1)
 	trace := payloadBytes >= 64*1024 || sequence <= 2
 
@@ -105,15 +110,7 @@ func (ws *flowsealRawWebSocket) sendFrame(frame []byte, payloadBytes int) error 
 			ws.logSessionID(), sequence, payloadBytes, len(frame), writtenFrameBytes, cumulative, duration.Milliseconds(), queueBefore, queueAfter, notSentBefore, notSentAfter, sendBufferBytes,
 		)
 	}
-
-	return drainFlowsealAfterWrite(
-		ws.conn,
-		ws.closed.Load,
-		ws.logSessionID(),
-		sequence,
-		payloadBytes,
-		len(frame),
-	)
+	return nil
 }
 
 func (ws *flowsealRawWebSocket) Recv() ([]byte, error) {
@@ -171,7 +168,7 @@ func (ws *flowsealRawWebSocket) Close() {
 }
 
 func (ws *flowsealRawWebSocket) writeControl(opcode int, payload []byte) error {
-	frame := buildFlowsealFrame(opcode, payload, true)
+	frame := buildFlowsealSingleFrame(opcode, payload, true, true)
 	ws.writeMu.Lock()
 	err := writeFlowsealFull(ws.conn, frame)
 	ws.writeMu.Unlock()
@@ -219,7 +216,25 @@ func (ws *flowsealRawWebSocket) readFrame() (int, []byte, bool, error) {
 	return opcode, payload, fin, nil
 }
 
+// buildFlowsealFrame normally emits one RFC6455 frame exactly like upstream
+// Flowseal. For the #29 device-only diagnostic, an exact 65536-byte binary
+// message is encoded as two RFC6455 fragments (65535 + 1). The logical
+// WebSocket message stays 65536 bytes, but neither wire frame uses the 64-bit
+// length-127 encoding. This isolates that boundary without changing MTProto
+// bytes or the Worker-visible message payload.
 func buildFlowsealFrame(opcode int, payload []byte, mask bool) []byte {
+	if opcode == opBinary && len(payload) == flowsealDiagnosticPayloadBoundary {
+		first := buildFlowsealSingleFrame(opcode, payload[:flowsealDiagnosticFirstFragmentBytes], mask, false)
+		last := buildFlowsealSingleFrame(opContinuation, payload[flowsealDiagnosticFirstFragmentBytes:], mask, true)
+		wire := make([]byte, 0, len(first)+len(last))
+		wire = append(wire, first...)
+		wire = append(wire, last...)
+		return wire
+	}
+	return buildFlowsealSingleFrame(opcode, payload, mask, true)
+}
+
+func buildFlowsealSingleFrame(opcode int, payload []byte, mask bool, fin bool) []byte {
 	length := len(payload)
 	headerLen := 2
 	if length >= 126 && length < 65536 {
@@ -231,7 +246,11 @@ func buildFlowsealFrame(opcode int, payload []byte, mask bool) []byte {
 		headerLen += 4
 	}
 	frame := make([]byte, headerLen+length)
-	frame[0] = byte(0x80 | opcode)
+	if fin {
+		frame[0] = 0x80 | byte(opcode)
+	} else {
+		frame[0] = byte(opcode)
+	}
 	position := 1
 	maskBit := byte(0)
 	if mask {
