@@ -65,6 +65,17 @@ func (ws *flowsealRawWebSocket) sendFrame(frame []byte, payloadBytes int) error 
 	ws.writeMu.Lock()
 	defer ws.writeMu.Unlock()
 
+	if err := waitFlowsealBackpressure(
+		ws.conn,
+		ws.closed.Load,
+		ws.logSessionID(),
+		sequence,
+		payloadBytes,
+		len(frame),
+	); err != nil {
+		return err
+	}
+
 	queueBefore := tcpSendQueueBytes(ws.conn)
 	sendBufferBytes := tcpSendBufferBytes(ws.conn)
 	started := time.Now()
