@@ -76,17 +76,20 @@ func testServerFrame(opcode int, payload []byte, fin bool) []byte {
 	}
 }
 
-func clientFramePayloadLengths(t *testing.T, data []byte) []int {
+type clientFrameMeta struct {
+	opcode  int
+	fin     bool
+	payload []byte
+}
+
+func clientFrames(t *testing.T, data []byte) []clientFrameMeta {
 	t.Helper()
 	reader := bytes.NewReader(data)
-	lengths := make([]int, 0, 4)
+	frames := make([]clientFrameMeta, 0, 4)
 	for reader.Len() > 0 {
 		first, err := reader.ReadByte()
 		if err != nil {
 			t.Fatalf("read frame first byte: %v", err)
-		}
-		if first&0x0F != opBinary {
-			t.Fatalf("opcode=%d want=%d", first&0x0F, opBinary)
 		}
 		second, err := reader.ReadByte()
 		if err != nil {
@@ -119,10 +122,26 @@ func clientFramePayloadLengths(t *testing.T, data []byte) []int {
 		if payloadLen > uint64(reader.Len()) {
 			t.Fatalf("payload length=%d remaining=%d", payloadLen, reader.Len())
 		}
-		if _, err := reader.Seek(int64(payloadLen), io.SeekCurrent); err != nil {
-			t.Fatalf("skip payload: %v", err)
+		payload := make([]byte, int(payloadLen))
+		if _, err := io.ReadFull(reader, payload); err != nil {
+			t.Fatalf("read payload: %v", err)
 		}
-		lengths = append(lengths, int(payloadLen))
+		xorMaskInPlace(payload, mask[:])
+		frames = append(frames, clientFrameMeta{
+			opcode:  int(first & 0x0F),
+			fin:     first&0x80 != 0,
+			payload: payload,
+		})
+	}
+	return frames
+}
+
+func clientFramePayloadLengths(t *testing.T, data []byte) []int {
+	t.Helper()
+	frames := clientFrames(t, data)
+	lengths := make([]int, 0, len(frames))
+	for _, frame := range frames {
+		lengths = append(lengths, len(frame.payload))
 	}
 	return lengths
 }
@@ -201,18 +220,57 @@ func TestMtProtoSafeFrameSocketHandlesPingBetweenFragments(t *testing.T) {
 	}
 }
 
-func TestMtProtoSafeFrameSocketPreservesLargeOutboundWriteAsSingleMessage(t *testing.T) {
+func TestMtProtoSafeFrameSocketLeavesSub64KiBOutboundWriteAsSingleFrame(t *testing.T) {
 	raw, conn := newFrameTestRaw(nil)
 	socket := &mtProtoSafeFrameSocket{raw: raw}
-	payload := bytes.Repeat([]byte{0x5A}, 65536)
+	payload := bytes.Repeat([]byte{0x4B}, mtProtoOutboundFragmentThreshold-1)
 
 	if err := socket.Send(payload); err != nil {
 		t.Fatalf("send: %v", err)
 	}
 
-	lengths := clientFramePayloadLengths(t, conn.writes.Bytes())
-	if len(lengths) != 1 || lengths[0] != len(payload) {
-		t.Fatalf("frame lengths=%v want=[%d]", lengths, len(payload))
+	frames := clientFrames(t, conn.writes.Bytes())
+	if len(frames) != 1 {
+		t.Fatalf("frames=%d want=1", len(frames))
+	}
+	if frames[0].opcode != opBinary || !frames[0].fin {
+		t.Fatalf("frame opcode=%d fin=%t want binary final", frames[0].opcode, frames[0].fin)
+	}
+	if !bytes.Equal(frames[0].payload, payload) {
+		t.Fatal("single-frame payload changed")
+	}
+}
+
+func TestMtProtoSafeFrameSocketFragments64KiBOutboundWriteAsSingleMessage(t *testing.T) {
+	raw, conn := newFrameTestRaw(nil)
+	socket := &mtProtoSafeFrameSocket{raw: raw}
+	payload := bytes.Repeat([]byte{0x5A}, mtProtoOutboundFragmentThreshold)
+
+	if err := socket.Send(payload); err != nil {
+		t.Fatalf("send: %v", err)
+	}
+
+	frames := clientFrames(t, conn.writes.Bytes())
+	if len(frames) != 4 {
+		t.Fatalf("frames=%d want=4", len(frames))
+	}
+	var reassembled []byte
+	for i, frame := range frames {
+		wantOpcode := opContinuation
+		if i == 0 {
+			wantOpcode = opBinary
+		}
+		wantFIN := i == len(frames)-1
+		if frame.opcode != wantOpcode || frame.fin != wantFIN {
+			t.Fatalf("frame %d opcode=%d fin=%t want opcode=%d fin=%t", i, frame.opcode, frame.fin, wantOpcode, wantFIN)
+		}
+		if len(frame.payload) != mtProtoOutboundFragmentPayloadLen {
+			t.Fatalf("frame %d payload=%d want=%d", i, len(frame.payload), mtProtoOutboundFragmentPayloadLen)
+		}
+		reassembled = append(reassembled, frame.payload...)
+	}
+	if !bytes.Equal(reassembled, payload) {
+		t.Fatal("fragmented WebSocket message payload changed")
 	}
 }
 
