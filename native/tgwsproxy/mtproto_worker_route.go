@@ -203,14 +203,14 @@ func mtProtoStatusField(value string) string {
 }
 
 type mtProtoWorkerConnector struct {
-	dial mtProtoWorkerDial
+	dial           mtProtoWorkerDial
+	flowsealParity bool
 }
 
 func newMtProtoWorkerConnector() *mtProtoWorkerConnector {
 	return &mtProtoWorkerConnector{
-		dial: func(domain, path, logPrefix string) (mtProtoFrameSocket, error) {
-			return dialWorkerCandidate(domain, path, logPrefix)
-		},
+		dial:           dialFlowsealWorkerCandidate,
+		flowsealParity: true,
 	}
 }
 
@@ -327,56 +327,72 @@ func (c *mtProtoWorkerConnector) Connect(
 			)
 		}
 
-		poolKey := WorkerPoolKey{
-			DC:           effectiveDC,
-			WorkerDomain: candidate.Domain,
-			Dst:          target,
-			Media:        effectiveMedia,
-		}
 		var ws mtProtoFrameSocket
 		var err error
-		if pooled := workerPool.GetForSession(poolKey); pooled != nil {
-			ws = pooled
+		if c.flowsealParity {
 			if logInfo != nil {
 				logInfo.Printf(
-					"MTProto Worker WS preconnect hit session_id=%s signed_dc=%d dc=%d media=%t worker_host=%s worker_dst=%s attempt=%d",
+					"MTProto Worker Flowseal parity fresh dial session_id=%s signed_dc=%d dc=%d media=%t worker_host=%s worker_dst=%s preconnect_bypassed=true attempt=%d",
 					sessionID,
 					request.SignedDC,
 					effectiveDC,
 					effectiveMedia,
 					candidate.Domain,
 					target,
-					i+1,
-				)
-			}
-		} else {
-			preconnectEnabled := workerWsPreconnectActive()
-			if logInfo != nil && preconnectEnabled {
-				logInfo.Printf(
-					"MTProto Worker WS preconnect miss session_id=%s signed_dc=%d dc=%d media=%t worker_host=%s worker_dst=%s attempt=%d",
-					sessionID,
-					request.SignedDC,
-					effectiveDC,
-					effectiveMedia,
-					candidate.Domain,
-					target,
-					i+1,
-				)
-			}
-			if logInfo != nil {
-				logInfo.Printf(
-					"MTProto Worker WS fresh dial session_id=%s signed_dc=%d dc=%d media=%t worker_host=%s worker_dst=%s preconnect_enabled=%t attempt=%d",
-					sessionID,
-					request.SignedDC,
-					effectiveDC,
-					effectiveMedia,
-					candidate.Domain,
-					target,
-					preconnectEnabled,
 					i+1,
 				)
 			}
 			ws, err = c.dial(candidate.Domain, path, prefix)
+		} else {
+			poolKey := WorkerPoolKey{
+				DC:           effectiveDC,
+				WorkerDomain: candidate.Domain,
+				Dst:          target,
+				Media:        effectiveMedia,
+			}
+			if pooled := workerPool.GetForSession(poolKey); pooled != nil {
+				ws = pooled
+				if logInfo != nil {
+					logInfo.Printf(
+						"MTProto Worker WS preconnect hit session_id=%s signed_dc=%d dc=%d media=%t worker_host=%s worker_dst=%s attempt=%d",
+						sessionID,
+						request.SignedDC,
+						effectiveDC,
+						effectiveMedia,
+						candidate.Domain,
+						target,
+						i+1,
+					)
+				}
+			} else {
+				preconnectEnabled := workerWsPreconnectActive()
+				if logInfo != nil && preconnectEnabled {
+					logInfo.Printf(
+						"MTProto Worker WS preconnect miss session_id=%s signed_dc=%d dc=%d media=%t worker_host=%s worker_dst=%s attempt=%d",
+						sessionID,
+						request.SignedDC,
+						effectiveDC,
+						effectiveMedia,
+						candidate.Domain,
+						target,
+						i+1,
+					)
+				}
+				if logInfo != nil {
+					logInfo.Printf(
+						"MTProto Worker WS fresh dial session_id=%s signed_dc=%d dc=%d media=%t worker_host=%s worker_dst=%s preconnect_enabled=%t attempt=%d",
+						sessionID,
+						request.SignedDC,
+						effectiveDC,
+						effectiveMedia,
+						candidate.Domain,
+						target,
+						preconnectEnabled,
+						i+1,
+					)
+				}
+				ws, err = c.dial(candidate.Domain, path, prefix)
+			}
 		}
 		if err != nil {
 			lastErr = err
@@ -398,7 +414,9 @@ func (c *mtProtoWorkerConnector) Connect(
 			workerStream.sessionID = sessionID
 			workerStream.workerDst = target
 		}
-		stream = wrapMtProtoWorkerPayloadTrace(stream, request, sessionID, target)
+		if !c.flowsealParity {
+			stream = wrapMtProtoWorkerPayloadTrace(stream, request, sessionID, target)
+		}
 
 		result.ActualBackend = mtProtoWorkerBackend
 		result.Reason = "connected"
