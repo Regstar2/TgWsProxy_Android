@@ -55,10 +55,7 @@ func connectFlowsealRawWebSocketContext(ctx context.Context, host, domain, path 
 	stopCancel := context.AfterFunc(ctx, func() { _ = rawConn.Close() })
 	defer stopCancel()
 
-	tlsConn := tls.Client(rawConn, &tls.Config{
-		InsecureSkipVerify: true,
-		ServerName:         domain,
-	})
+	tlsConn := tls.Client(rawConn, flowsealWorkerTLSConfig(domain))
 	deadline := time.Now().Add(time.Duration(timeout * float64(time.Second)))
 	_ = tlsConn.SetDeadline(deadline)
 	if err := tlsConn.HandshakeContext(ctx); err != nil {
@@ -115,7 +112,7 @@ func connectFlowsealRawWebSocketContext(ctx context.Context, host, domain, path 
 	if statusCode == 101 {
 		if logInfo != nil {
 			state := tlsConn.ConnectionState()
-			logInfo.Printf("MTProto Worker transport ready session_id=%s remote=%s tls_version=%x cipher=%x worker_revision=%s",
+			logInfo.Printf("MTProto Worker transport ready session_id=%s remote=%s tls_version=%x cipher=%x tls_record_sizing=fixed worker_revision=%s",
 				flowsealSessionIDFromPath(path), rawConn.RemoteAddr(), state.Version, state.CipherSuite,
 				flowsealResponseHeader(responseLines, "X-Tgws-Worker-Revision"))
 		}
@@ -140,6 +137,17 @@ func connectFlowsealRawWebSocketContext(ctx context.Context, host, domain, path 
 		StatusLine: firstLine,
 		Headers:    headers,
 		Location:   headers["location"],
+	}
+}
+
+func flowsealWorkerTLSConfig(domain string) *tls.Config {
+	return &tls.Config{
+		InsecureSkipVerify: true, // Preserve the existing Flowseal verification policy.
+		ServerName:         domain,
+		// Flowseal uses OpenSSL's full-size records. Keep WS messages intact and
+		// isolate Go's adaptive TLS record sizing in the #29 device experiment.
+		// This is not evidence that record sizing caused the observed TCP loss.
+		DynamicRecordSizingDisabled: true,
 	}
 }
 

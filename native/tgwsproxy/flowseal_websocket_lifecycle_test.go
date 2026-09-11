@@ -215,9 +215,7 @@ func TestFlowsealTLSBulkRoundTrip(t *testing.T) {
 		serverDone <- writeFlowsealFull(conn, buildFlowsealSingleFrame(opBinary, reply, false, true))
 	}))
 	defer server.Close()
-	conn, err := tls.Dial("tcp", strings.TrimPrefix(server.URL, "https://"), &tls.Config{
-		InsecureSkipVerify: true, // Local httptest certificate only.
-	})
+	conn, err := tls.Dial("tcp", strings.TrimPrefix(server.URL, "https://"), flowsealWorkerTLSConfig("localhost"))
 	if err != nil {
 		t.Fatal(err)
 	}

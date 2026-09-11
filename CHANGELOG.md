@@ -4,6 +4,9 @@ All notable user-facing changes are listed here. Detailed notes for older releas
 
 ## Unreleased - Worker transport investigation (#29, PR #39)
 
+- Worker transport cancellation closes the underlying TCP socket immediately instead of waiting for a TLS close-notify write; the original write timeout remains visible to the parallel reader.
+- The next #29 device experiment uses fixed-size TLS records on the Flowseal Worker route. This removes Go's adaptive record sizing without changing WebSocket message boundaries; effectiveness on the affected network remains unverified.
+- Worker transport closure now records TCP counters for short zero-down sessions as well as blocked bulk writes.
 - Worker WebSocket close/cancellation no longer waits behind a blocked write; stream deadlines reach the socket and frame writes have a 45-second ceiling.
 - Removed the unsuccessful 65535 + 1 fragment probe and restored one complete outbound WebSocket message. Removed shared 16-KiB segmentation that also changed packet-oriented routes.
 - Worker source now connects TCP lazily, orders asynchronous message conversion with writes, bounds its queue and cancels pending writes on close.
@@ -157,4 +160,3 @@ All notable user-facing changes are listed here. Detailed notes for older releas
 - “Recommended” preset in route policy UI.
 
 Earlier versions: see [docs/releases/](docs/releases/).
-

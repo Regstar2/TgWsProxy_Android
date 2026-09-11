@@ -76,6 +76,7 @@ try {
     & $adb -s $DeviceSerial shell am start -n "com.amurcanov.tgwsproxy/.MainActivity"
     if ($LASTEXITCODE -ne 0) { throw "Could not open TgWsProxy." }
     Write-Host "Use the updated Worker (worker_revision=worker-stream-v2)."
+    Write-Host "This APK tests fixed TLS records; confirm tls_record_sizing=fixed in transport ready."
     Write-Host "Enable runtime logging, Worker only, preconnect OFF, PRESERVE_ORIGINAL_DST."
     Write-Host "Restart the proxy, connect Telegram, upload and download a file larger than 20 MiB."
     Write-Host "Keep Cloudflare live logs open with WORKER_DIAGNOSTICS=1."
