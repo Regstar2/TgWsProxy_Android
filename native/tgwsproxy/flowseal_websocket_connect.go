@@ -28,7 +28,7 @@ func dialFlowsealWorkerCandidateContext(ctx context.Context, domain, path, logPr
 	if logInfo != nil {
 		logInfo.Printf("%s Flowseal parity transport connected host=%s path=%s worker_transport=wss_relay_v3 pool=false preconnect=false", logPrefix, domain, v3Path)
 	}
-	return ws, nil
+	return newWorkerWSSRelayV3FrameSocket(ws), nil
 }
 
 // flowsealWorkerWSSRelayPath moves only the Flowseal-parity MTProto Worker dial
