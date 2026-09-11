@@ -19,15 +19,28 @@ func dialFlowsealWorkerCandidate(domain, path, logPrefix string) (mtProtoFrameSo
 }
 
 func dialFlowsealWorkerCandidateContext(ctx context.Context, domain, path, logPrefix string) (mtProtoFrameSocket, error) {
-	ws, err := connectFlowsealRawWebSocketContext(ctx, domain, domain, path, 10)
+	v3Path := flowsealWorkerWSSRelayPath(path)
+	ws, err := connectFlowsealRawWebSocketContext(ctx, domain, domain, v3Path, 10)
 	if err != nil {
 		logDomainConnectFailure(logPrefix, domain, domain, err)
 		return nil, err
 	}
 	if logInfo != nil {
-		logInfo.Printf("%s Flowseal parity transport connected host=%s path=%s pool=false preconnect=false", logPrefix, domain, path)
+		logInfo.Printf("%s Flowseal parity transport connected host=%s path=%s worker_transport=wss_relay_v3 pool=false preconnect=false", logPrefix, domain, v3Path)
 	}
 	return ws, nil
+}
+
+// flowsealWorkerWSSRelayPath moves only the Flowseal-parity MTProto Worker dial
+// to the experimental v3 endpoint. The shared /apiws builder and legacy Worker
+// routes remain unchanged so v2 stays available for A/B testing.
+func flowsealWorkerWSSRelayPath(path string) string {
+	parsed, err := url.ParseRequestURI(path)
+	if err != nil || parsed.Path != "/apiws" {
+		return path
+	}
+	parsed.Path = "/apiws-ws"
+	return parsed.RequestURI()
 }
 
 func connectFlowsealRawWebSocket(host, domain, path string, timeout float64) (*flowsealRawWebSocket, error) {
