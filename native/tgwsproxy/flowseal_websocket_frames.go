@@ -14,7 +14,7 @@ import (
 
 const (
 	flowsealMaxWebSocketMessageLen = 16 * 1024 * 1024
-	flowsealFrameWriteTimeout     = 45 * time.Second
+	flowsealFrameWriteTimeout      = 45 * time.Second
 )
 
 // flowsealRawWebSocket mirrors Flowseal's RawWebSocket message semantics and
@@ -29,6 +29,8 @@ type flowsealRawWebSocket struct {
 	writeDeadline time.Time
 	frameDeadline time.Time
 	closed        atomic.Bool
+	errorMu       sync.Mutex
+	terminalErr   error
 	frag          []byte
 	sendCount     atomic.Uint64
 	recvCount     atomic.Uint64
@@ -38,7 +40,7 @@ type flowsealRawWebSocket struct {
 
 func (ws *flowsealRawWebSocket) Send(data []byte) error {
 	if ws == nil || ws.closed.Load() {
-		return fmt.Errorf("WebSocket closed")
+		return ws.failureOr(net.ErrClosed)
 	}
 	if len(data) > flowsealMaxWebSocketMessageLen {
 		return fmt.Errorf("WS message too large: %d bytes", len(data))
@@ -49,7 +51,7 @@ func (ws *flowsealRawWebSocket) Send(data []byte) error {
 
 func (ws *flowsealRawWebSocket) SendBatch(parts [][]byte) error {
 	if ws == nil || ws.closed.Load() {
-		return fmt.Errorf("WebSocket closed")
+		return ws.failureOr(net.ErrClosed)
 	}
 	for _, part := range parts {
 		if err := ws.Send(part); err != nil {
@@ -61,7 +63,7 @@ func (ws *flowsealRawWebSocket) SendBatch(parts [][]byte) error {
 
 func (ws *flowsealRawWebSocket) sendFrame(frame []byte, payloadBytes int) error {
 	if ws == nil || ws.closed.Load() {
-		return fmt.Errorf("WebSocket closed")
+		return ws.failureOr(net.ErrClosed)
 	}
 
 	// Keep application messages ordered; writeMu serializes data and control
@@ -77,11 +79,11 @@ func (ws *flowsealRawWebSocket) sendFrame(frame []byte, payloadBytes int) error 
 	ws.writeMu.Lock()
 	if ws.closed.Load() {
 		ws.writeMu.Unlock()
-		return net.ErrClosed
+		return ws.failureOr(net.ErrClosed)
 	}
 	if err := ws.beginFrameWrite(); err != nil {
 		ws.writeMu.Unlock()
-		ws.Close()
+		ws.fail(err)
 		return err
 	}
 	queueBefore := tcpSendQueueBytes(ws.conn)
@@ -106,7 +108,7 @@ func (ws *flowsealRawWebSocket) sendFrame(frame []byte, payloadBytes int) error 
 
 	if err != nil {
 		// A partial TLS/WebSocket write cannot be replayed on this stream.
-		ws.Close()
+		ws.fail(err)
 		if logInfo != nil {
 			logInfo.Printf(
 				"MTProto Worker Flowseal parity WS write failed session_id=%s seq=%d payload_bytes=%d frame_bytes=%d written_frame_bytes=%d duration_ms=%d tcp_send_queue_before=%d tcp_send_queue_after=%d tcp_not_sent_before=%d tcp_not_sent_after=%d tcp_send_buffer_bytes=%d error=%v",
@@ -130,9 +132,8 @@ func (ws *flowsealRawWebSocket) Recv() ([]byte, error) {
 	for ws != nil && !ws.closed.Load() {
 		opcode, payload, fin, err := ws.readFrame()
 		if err != nil {
-			ws.closed.Store(true)
-			_ = ws.conn.Close()
-			return nil, err
+			ws.fail(err)
+			return nil, ws.failureOr(err)
 		}
 		switch opcode {
 		case opClose:
@@ -152,8 +153,9 @@ func (ws *flowsealRawWebSocket) Recv() ([]byte, error) {
 			}
 			ws.frag = append(ws.frag, payload...)
 			if len(ws.frag) > flowsealMaxWebSocketMessageLen {
-				ws.Close()
-				return nil, fmt.Errorf("WS message too large: %d bytes", len(ws.frag))
+				err := fmt.Errorf("WS message too large: %d bytes", len(ws.frag))
+				ws.fail(err)
+				return nil, err
 			}
 			if !fin {
 				continue
@@ -164,16 +166,24 @@ func (ws *flowsealRawWebSocket) Recv() ([]byte, error) {
 			return message, nil
 		}
 	}
-	return nil, io.EOF
+	return nil, ws.failureOr(io.EOF)
 }
 
 func (ws *flowsealRawWebSocket) Close() {
 	if ws == nil || ws.closed.Swap(true) {
 		return
 	}
-	// Closing the transport unblocks a concurrent write even under backpressure.
-	// A close control frame would wait for that same writer's mutex.
-	_ = ws.conn.Close()
+	if logInfo != nil {
+		logInfo.Printf("MTProto Worker transport closed session_id=%s sent_bytes=%d recv_bytes=%d %s",
+			ws.logSessionID(), ws.sentBytes.Load(), ws.recvBytes.Load(), tcpTransportState(ws.conn))
+	}
+	// tls.Conn.Close can try to write close_notify for another five seconds
+	// after a failed Write. Cancellation must close the underlying transport.
+	conn := ws.conn
+	if wrapped, ok := conn.(interface{ NetConn() net.Conn }); ok {
+		conn = wrapped.NetConn()
+	}
+	_ = conn.Close()
 }
 
 func (ws *flowsealRawWebSocket) writeControl(opcode int, payload []byte) error {
@@ -181,15 +191,16 @@ func (ws *flowsealRawWebSocket) writeControl(opcode int, payload []byte) error {
 	ws.writeMu.Lock()
 	defer ws.writeMu.Unlock()
 	if ws.closed.Load() {
-		return net.ErrClosed
+		return ws.failureOr(net.ErrClosed)
 	}
 	if err := ws.beginFrameWrite(); err != nil {
+		ws.fail(err)
 		return err
 	}
 	defer ws.endFrameWrite()
 	err := writeFlowsealFull(ws.conn, frame)
 	if err != nil {
-		ws.Close()
+		ws.fail(err)
 	}
 	return err
 }

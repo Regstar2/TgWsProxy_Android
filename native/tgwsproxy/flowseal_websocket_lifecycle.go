@@ -2,6 +2,29 @@ package main
 
 import "time"
 
+// Publish the failure before closing the socket. Otherwise the other bridge
+// direction can win the race and report only a secondary "closed connection".
+func (ws *flowsealRawWebSocket) fail(err error) {
+	ws.errorMu.Lock()
+	if ws.terminalErr == nil {
+		ws.terminalErr = err
+	}
+	ws.errorMu.Unlock()
+	ws.Close()
+}
+
+func (ws *flowsealRawWebSocket) failureOr(fallback error) error {
+	if ws == nil {
+		return fallback
+	}
+	ws.errorMu.Lock()
+	defer ws.errorMu.Unlock()
+	if ws.terminalErr != nil {
+		return ws.terminalErr
+	}
+	return fallback
+}
+
 func (ws *flowsealRawWebSocket) SetDeadline(t time.Time) error {
 	if err := ws.SetReadDeadline(t); err != nil {
 		return err

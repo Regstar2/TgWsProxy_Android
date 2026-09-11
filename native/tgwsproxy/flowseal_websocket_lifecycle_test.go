@@ -118,6 +118,65 @@ func TestWorkerStreamReadDeadlineIsForwarded(t *testing.T) {
 	}
 }
 
+func TestFlowsealWriteTimeoutRemainsVisibleToReader(t *testing.T) {
+	ws, _, writeDone := blockedFlowsealSocket(t)
+	readDone := make(chan error, 1)
+	go func() { _, err := ws.Recv(); readDone <- err }()
+	if err := ws.SetWriteDeadline(time.Now().Add(-time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	for _, result := range []<-chan error{writeDone, readDone} {
+		select {
+		case err := <-result:
+			var timeout net.Error
+			if !errors.As(err, &timeout) || !timeout.Timeout() {
+				t.Fatalf("write timeout was hidden by cancellation: %v", err)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatal("timeout did not stop both directions")
+		}
+	}
+	if _, err := ws.Recv(); err == nil || errors.Is(err, io.EOF) {
+		t.Fatalf("subsequent Recv lost the failure: %v", err)
+	}
+}
+
+func TestFlowsealCloseDoesNotWaitForTLSCloseNotify(t *testing.T) {
+	certServer := httptest.NewTLSServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	defer certServer.Close()
+	raw, peer := net.Pipe()
+	defer raw.Close()
+	defer peer.Close()
+	client := tls.Client(raw, &tls.Config{
+		InsecureSkipVerify: true, // Local test certificate only.
+		MaxVersion:         tls.VersionTLS12,
+	})
+	server := tls.Server(peer, &tls.Config{Certificates: certServer.TLS.Certificates})
+	_ = raw.SetDeadline(time.Now().Add(2 * time.Second))
+	_ = peer.SetDeadline(time.Now().Add(2 * time.Second))
+	handshake := make(chan error, 1)
+	go func() { handshake <- server.Handshake() }()
+	if err := client.Handshake(); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-handshake; err != nil {
+		t.Fatal(err)
+	}
+	_ = raw.SetDeadline(time.Time{})
+	_ = peer.SetDeadline(time.Time{})
+	// The peer stops reading after the handshake. TLS close_notify cannot drain.
+	ws := &flowsealRawWebSocket{conn: client, reader: bufio.NewReader(client)}
+	done := make(chan struct{})
+	go func() { ws.Close(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(500 * time.Millisecond):
+		_ = peer.Close()
+		<-done
+		t.Fatal("transport cancellation waited for a TLS close_notify write")
+	}
+}
+
 // Uses real TCP/TLS and serialized masked frames. This is not a Cloudflare or
 // Telegram acceptance test; it checks bulk delivery beyond the old stall point.
 func TestFlowsealTLSBulkRoundTrip(t *testing.T) {
