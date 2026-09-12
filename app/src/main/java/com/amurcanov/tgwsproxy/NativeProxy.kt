@@ -22,6 +22,7 @@ interface ProxyLibrary : Library {
     fun StopMtProtoProxy(): Int
     fun GetMtProtoProxyStatus(): Pointer?
     fun RunWorkerNetworkProbe(domain: String): Pointer?
+    fun RunWorkerNetworkProbeWithFamily(domain: String, family: String): Pointer?
     fun ResetAdaptiveRouteStats(all: Int)
     fun ResetAdaptiveNetworkRouteStats(profileId: String)
     fun FreeString(p: Pointer)
@@ -78,8 +79,8 @@ object NativeProxy {
         ProxyLibrary.INSTANCE.FreeString(ptr)
         return res
     }
-    fun runWorkerNetworkProbe(domain: String): String? {
-        val ptr = ProxyLibrary.INSTANCE.RunWorkerNetworkProbe(domain) ?: return null
+    fun runWorkerNetworkProbe(domain: String, family: String = "auto"): String? {
+        val ptr = ProxyLibrary.INSTANCE.RunWorkerNetworkProbeWithFamily(domain, family) ?: return null
         val res = ptr.getString(0)
         ProxyLibrary.INSTANCE.FreeString(ptr)
         return res
