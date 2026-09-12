@@ -4,7 +4,7 @@ param(
     [string]$WorkerDomain,
     [ValidateSet("Auto", "IPv4", "IPv6")]
     [string]$IPFamily = "Auto",
-    [ValidateSet("Go", "OkHttp", "OkHttpNoCompression", "OkHttpRandom", "OkHttpNoCompressionRandom", "SSLSocket", "UTLS", "GoDynamic", "GoSplit1200", "GoSplit4K", "GoSplit16K", "GoPaced4K")]
+    [ValidateSet("Go", "OkHttp", "OkHttpNoCompression", "OkHttpRandom", "OkHttpNoCompressionRandom", "SSLSocket", "FreshHTTP", "UTLS", "GoDynamic", "GoSplit1200", "GoSplit4K", "GoSplit16K", "GoPaced4K")]
     [string]$Transport = "Go",
     [switch]$SkipBuild,
     [string]$DeviceSerial = "",
@@ -108,7 +108,7 @@ $finalDump | Set-Content -Encoding UTF8 $runtimeLog
 
 Write-Host ""
 Write-Host "=== Probe summary ==="
-$finalDump | Select-String "Worker network probe|MTProto Worker transport ready|PROBE_" | ForEach-Object { $_.Line }
+$finalDump | Select-String "Worker network probe|Worker fresh-connection probe|MTProto Worker transport ready|PROBE_" | ForEach-Object { $_.Line }
 Write-Host ""
 Write-Host "Runtime log: $runtimeLog"
 Write-Host "Metadata:    $metaLog"
