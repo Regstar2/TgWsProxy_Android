@@ -25,18 +25,23 @@ $first = $true
 foreach ($transport in $transports) {
     Write-Host ""
     Write-Host "=== $transport / $IPFamily ==="
-    $runnerArgs = @(
-        "-WorkerDomain", $WorkerDomain,
-        "-Transport", $transport,
-        "-IPFamily", $IPFamily,
-        "-TimeoutSeconds", $TimeoutSeconds
-    )
+
+    # Use hashtable splatting so PowerShell binds these as named parameters.
+    # Array splatting would pass '-WorkerDomain', the domain, etc. positionally,
+    # causing the domain value to be bound to IPFamily.
+    $runnerArgs = @{
+        WorkerDomain   = $WorkerDomain
+        Transport      = $transport
+        IPFamily       = $IPFamily
+        TimeoutSeconds = $TimeoutSeconds
+    }
     if ($DeviceSerial) {
-        $runnerArgs += @("-DeviceSerial", $DeviceSerial)
+        $runnerArgs.DeviceSerial = $DeviceSerial
     }
     if (-not $first) {
-        $runnerArgs += "-SkipBuild"
+        $runnerArgs.SkipBuild = $true
     }
+
     & $runner @runnerArgs
     if ($LASTEXITCODE -ne 0) {
         throw "Probe failed for transport $transport"
