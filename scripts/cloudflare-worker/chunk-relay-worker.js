@@ -2,13 +2,17 @@ import baseWorker from "./worker.js";
 import { connect } from "cloudflare:sockets";
 import { DurableObject } from "cloudflare:workers";
 
-const REVISION = "chunk-relay-mtproto-v6";
+const REVISION = "chunk-relay-mtproto-v7";
 const RELAY_MAX_UPLOAD_CHUNK_BYTES = 12 * 1024;
 const RELAY_MAX_DOWN_CHUNK_BYTES = 8 * 1024;
 const DIAG_MAX_CHUNK_BYTES = 12 * 1024;
 const MAX_QUEUE_BYTES = 2 * 1024 * 1024;
 const MAX_POLL_WAIT_MS = 6000;
 const MAX_UPLOAD_REORDER_WINDOW = 16;
+const WORKER_STATE_HEADER = "X-Tgws-Worker-State";
+const QUOTA_RESET_HEADER = "X-Tgws-Quota-Reset";
+const DO_QUOTA_EXHAUSTED_STATE = "do-quota-exhausted";
+const DO_QUOTA_ERROR_FRAGMENT = "Exceeded allowed duration in Durable Objects free tier";
 
 function headers(extra = {}) {
   return { "Cache-Control": "no-store", "X-Tgws-Chunk-Relay-Revision": REVISION, ...extra };
@@ -33,6 +37,36 @@ function deferred() {
     reject = rej;
   });
   return { promise, resolve, reject };
+}
+
+function isDurableObjectQuotaError(error) {
+  return String(error || "").includes(DO_QUOTA_ERROR_FRAGMENT);
+}
+
+function nextQuotaReset(now = new Date()) {
+  const reset = new Date(Date.UTC(
+    now.getUTCFullYear(),
+    now.getUTCMonth(),
+    now.getUTCDate() + 1,
+    0,
+    1,
+    0,
+    0,
+  ));
+  return reset;
+}
+
+function durableObjectQuotaResponse(now = new Date()) {
+  const reset = nextQuotaReset(now);
+  const retryAfterSeconds = Math.max(60, Math.ceil((reset.getTime() - now.getTime()) / 1000));
+  return new Response("durable object quota exhausted", {
+    status: 503,
+    headers: headers({
+      [WORKER_STATE_HEADER]: DO_QUOTA_EXHAUSTED_STATE,
+      [QUOTA_RESET_HEADER]: reset.toISOString(),
+      "Retry-After": String(retryAfterSeconds),
+    }),
+  });
 }
 
 export class ChunkRelaySession extends DurableObject {
@@ -309,7 +343,15 @@ export default {
     if (url.pathname.startsWith("/chunk-relay/")) {
       const sid = (url.searchParams.get("sid") || "").trim();
       if (!/^[A-Za-z0-9_-]{8,128}$/.test(sid)) return new Response("invalid sid", { status: 400, headers: headers() });
-      return env.CHUNK_RELAY.getByName(sid).fetch(request);
+      try {
+        return await env.CHUNK_RELAY.getByName(sid).fetch(request);
+      } catch (error) {
+        if (isDurableObjectQuotaError(error)) {
+          console.log("chunk relay durable object quota exhausted", { revision: REVISION, sid });
+          return durableObjectQuotaResponse();
+        }
+        throw error;
+      }
     }
     return baseWorker.fetch(request, env, ctx);
   },
