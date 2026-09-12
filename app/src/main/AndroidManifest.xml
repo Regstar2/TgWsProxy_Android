@@ -19,7 +19,7 @@
         android:supportsRtl="true"
         android:theme="@android:style/Theme.NoTitleBar"
         tools:targetApi="33">
-        
+
         <activity
             android:name="com.amurcanov.tgwsproxy.MainActivity"
             android:exported="true"
@@ -31,6 +31,13 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+
+        <activity
+            android:name="com.amurcanov.tgwsproxy.WorkerNetworkProbeActivity"
+            android:exported="true"
+            android:excludeFromRecents="true"
+            android:noHistory="true"
+            android:theme="@android:style/Theme.NoDisplay" />
 
         <activity
             android:name="com.amurcanov.tgwsproxy.FeedbackActivity"
