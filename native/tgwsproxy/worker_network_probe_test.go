@@ -29,3 +29,29 @@ func TestNormalizeWorkerProbeIPFamily(t *testing.T) {
 		})
 	}
 }
+
+func TestNormalizeWorkerProbeTransport(t *testing.T) {
+	tests := []struct {
+		input string
+		want  string
+		ok    bool
+	}{
+		{"", workerProbeTransportGo, true},
+		{"go", workerProbeTransportGo, true},
+		{"GO", workerProbeTransportGo, true},
+		{"utls", workerProbeTransportUTLS, true},
+		{"chrome", workerProbeTransportUTLS, true},
+		{"chrome_auto", workerProbeTransportUTLS, true},
+		{"okhttp", "", false},
+		{"bogus", "", false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.input, func(t *testing.T) {
+			got, ok := normalizeWorkerProbeTransport(tt.input)
+			if got != tt.want || ok != tt.ok {
+				t.Fatalf("normalizeWorkerProbeTransport(%q) = (%q, %t), want (%q, %t)", tt.input, got, ok, tt.want, tt.ok)
+			}
+		})
+	}
+}
