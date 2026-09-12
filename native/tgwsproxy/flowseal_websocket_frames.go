@@ -20,22 +20,25 @@ const (
 // flowsealRawWebSocket mirrors Flowseal's RawWebSocket message semantics and
 // intentionally stays separate from the Android RawWebSocket abstraction.
 type flowsealRawWebSocket struct {
-	conn          net.Conn
-	reader        *bufio.Reader
-	sessionID     string
-	sendMu        sync.Mutex
-	writeMu       sync.Mutex
-	deadlineMu    sync.Mutex
-	writeDeadline time.Time
-	frameDeadline time.Time
-	closed        atomic.Bool
-	errorMu       sync.Mutex
-	terminalErr   error
-	frag          []byte
-	sendCount     atomic.Uint64
-	recvCount     atomic.Uint64
-	sentBytes     atomic.Uint64
-	recvBytes     atomic.Uint64
+	conn                net.Conn
+	reader              *bufio.Reader
+	sessionID           string
+	tlsWriteChunkBytes  int
+	tlsWritePace        time.Duration
+	tlsWriteProfileName string
+	sendMu              sync.Mutex
+	writeMu             sync.Mutex
+	deadlineMu          sync.Mutex
+	writeDeadline       time.Time
+	frameDeadline       time.Time
+	closed              atomic.Bool
+	errorMu             sync.Mutex
+	terminalErr         error
+	frag                []byte
+	sendCount           atomic.Uint64
+	recvCount           atomic.Uint64
+	sentBytes           atomic.Uint64
+	recvBytes           atomic.Uint64
 }
 
 func (ws *flowsealRawWebSocket) Send(data []byte) error {
@@ -92,13 +95,13 @@ func (ws *flowsealRawWebSocket) sendFrame(frame []byte, payloadBytes int) error 
 	started := time.Now()
 	if logInfo != nil && trace {
 		logInfo.Printf(
-			"MTProto Worker Flowseal parity WS write start session_id=%s seq=%d payload_bytes=%d frame_bytes=%d tcp_send_queue_before=%d tcp_not_sent_before=%d tcp_send_buffer_bytes=%d",
-			ws.logSessionID(), sequence, payloadBytes, len(frame), queueBefore, notSentBefore, sendBufferBytes,
+			"MTProto Worker Flowseal parity WS write start session_id=%s seq=%d payload_bytes=%d frame_bytes=%d tls_write_profile=%s tls_write_chunk_bytes=%d tls_write_pace_us=%d tcp_send_queue_before=%d tcp_not_sent_before=%d tcp_send_buffer_bytes=%d",
+			ws.logSessionID(), sequence, payloadBytes, len(frame), ws.logTLSWriteProfile(), ws.tlsWriteChunkBytes, ws.tlsWritePace.Microseconds(), queueBefore, notSentBefore, sendBufferBytes,
 		)
 	}
 
 	stopTrace := ws.traceBlockedWrite(sequence, trace)
-	writtenFrameBytes, err := writeFlowsealFullCount(ws.conn, frame)
+	writtenFrameBytes, err := writeFlowsealShapedFullCount(ws.conn, frame, ws.tlsWriteChunkBytes, ws.tlsWritePace)
 	stopTrace()
 	ws.endFrameWrite()
 	duration := time.Since(started)
@@ -111,8 +114,8 @@ func (ws *flowsealRawWebSocket) sendFrame(frame []byte, payloadBytes int) error 
 		ws.fail(err)
 		if logInfo != nil {
 			logInfo.Printf(
-				"MTProto Worker Flowseal parity WS write failed session_id=%s seq=%d payload_bytes=%d frame_bytes=%d written_frame_bytes=%d duration_ms=%d tcp_send_queue_before=%d tcp_send_queue_after=%d tcp_not_sent_before=%d tcp_not_sent_after=%d tcp_send_buffer_bytes=%d error=%v",
-				ws.logSessionID(), sequence, payloadBytes, len(frame), writtenFrameBytes, duration.Milliseconds(), queueBefore, queueAfter, notSentBefore, notSentAfter, sendBufferBytes, err,
+				"MTProto Worker Flowseal parity WS write failed session_id=%s seq=%d payload_bytes=%d frame_bytes=%d written_frame_bytes=%d duration_ms=%d tls_write_profile=%s tls_write_chunk_bytes=%d tls_write_pace_us=%d tcp_send_queue_before=%d tcp_send_queue_after=%d tcp_not_sent_before=%d tcp_not_sent_after=%d tcp_send_buffer_bytes=%d error=%v",
+				ws.logSessionID(), sequence, payloadBytes, len(frame), writtenFrameBytes, duration.Milliseconds(), ws.logTLSWriteProfile(), ws.tlsWriteChunkBytes, ws.tlsWritePace.Microseconds(), queueBefore, queueAfter, notSentBefore, notSentAfter, sendBufferBytes, err,
 			)
 		}
 		return err
@@ -121,8 +124,8 @@ func (ws *flowsealRawWebSocket) sendFrame(frame []byte, payloadBytes int) error 
 	cumulative := ws.sentBytes.Add(uint64(payloadBytes))
 	if logInfo != nil && trace {
 		logInfo.Printf(
-			"MTProto Worker Flowseal parity WS send session_id=%s seq=%d payload_bytes=%d frame_bytes=%d written_frame_bytes=%d cumulative_payload_bytes=%d duration_ms=%d tcp_send_queue_before=%d tcp_send_queue_after=%d tcp_not_sent_before=%d tcp_not_sent_after=%d tcp_send_buffer_bytes=%d",
-			ws.logSessionID(), sequence, payloadBytes, len(frame), writtenFrameBytes, cumulative, duration.Milliseconds(), queueBefore, queueAfter, notSentBefore, notSentAfter, sendBufferBytes,
+			"MTProto Worker Flowseal parity WS send session_id=%s seq=%d payload_bytes=%d frame_bytes=%d written_frame_bytes=%d cumulative_payload_bytes=%d duration_ms=%d tls_write_profile=%s tls_write_chunk_bytes=%d tls_write_pace_us=%d tcp_send_queue_before=%d tcp_send_queue_after=%d tcp_not_sent_before=%d tcp_not_sent_after=%d tcp_send_buffer_bytes=%d",
+			ws.logSessionID(), sequence, payloadBytes, len(frame), writtenFrameBytes, cumulative, duration.Milliseconds(), ws.logTLSWriteProfile(), ws.tlsWriteChunkBytes, ws.tlsWritePace.Microseconds(), queueBefore, queueAfter, notSentBefore, notSentAfter, sendBufferBytes,
 		)
 	}
 	return nil
@@ -198,7 +201,7 @@ func (ws *flowsealRawWebSocket) writeControl(opcode int, payload []byte) error {
 		return err
 	}
 	defer ws.endFrameWrite()
-	err := writeFlowsealFull(ws.conn, frame)
+	err := writeFlowsealShapedFull(ws.conn, frame, ws.tlsWriteChunkBytes, ws.tlsWritePace)
 	if err != nil {
 		ws.fail(err)
 	}
@@ -324,6 +327,33 @@ func writeFlowsealFullCount(writer io.Writer, data []byte) (int, error) {
 	return total, nil
 }
 
+func writeFlowsealShapedFull(writer io.Writer, data []byte, chunkBytes int, pace time.Duration) error {
+	_, err := writeFlowsealShapedFullCount(writer, data, chunkBytes, pace)
+	return err
+}
+
+func writeFlowsealShapedFullCount(writer io.Writer, data []byte, chunkBytes int, pace time.Duration) (int, error) {
+	if chunkBytes <= 0 || chunkBytes >= len(data) {
+		return writeFlowsealFullCount(writer, data)
+	}
+	total := 0
+	for total < len(data) {
+		end := total + chunkBytes
+		if end > len(data) {
+			end = len(data)
+		}
+		written, err := writeFlowsealFullCount(writer, data[total:end])
+		total += written
+		if err != nil {
+			return total, err
+		}
+		if total < len(data) && pace > 0 {
+			time.Sleep(pace)
+		}
+	}
+	return total, nil
+}
+
 func (ws *flowsealRawWebSocket) noteRecv(payloadBytes int) {
 	sequence := ws.recvCount.Add(1)
 	cumulative := ws.recvBytes.Add(uint64(payloadBytes))
@@ -340,6 +370,13 @@ func (ws *flowsealRawWebSocket) logSessionID() string {
 		return "none"
 	}
 	return mtProtoStatusField(ws.sessionID)
+}
+
+func (ws *flowsealRawWebSocket) logTLSWriteProfile() string {
+	if ws == nil || strings.TrimSpace(ws.tlsWriteProfileName) == "" {
+		return "default"
+	}
+	return mtProtoStatusField(ws.tlsWriteProfileName)
 }
 
 func underlyingTCPConn(conn net.Conn) *net.TCPConn {
