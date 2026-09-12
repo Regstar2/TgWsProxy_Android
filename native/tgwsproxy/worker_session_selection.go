@@ -14,7 +14,7 @@ const workerSelectionStrategyRoundRobin = "ROUND_ROBIN"
 // selected Worker therefore stays sticky for the whole session while different
 // sessions are spread across the configured Worker pool. Workers with an open
 // runtime circuit are filtered after ordering so quota-exhausted endpoints do
-// not receive repeated connection attempts.
+// not receive repeated network connection attempts.
 func workerCandidatesForSession(
 	settings workerFailoverSettings,
 	fallbackDomain string,
@@ -32,7 +32,30 @@ func workerCandidatesForSession(
 			candidates = rotated
 		}
 	}
-	return filterWorkerCandidatesByCircuit(candidates, time.Now()), start
+
+	now := time.Now()
+	available := filterWorkerCandidatesByCircuit(candidates, now)
+	if len(available) > 0 || len(candidates) == 0 {
+		return available, start
+	}
+
+	// Keep a single blocked candidate as a local diagnostic probe. The chunk
+	// relay dialer rejects it immediately from the in-memory circuit state, so
+	// no request reaches Cloudflare. This lets the MTProto connector report
+	// all_workers_circuit_open instead of the misleading worker_not_configured.
+	summary := summarizeWorkerCandidateCircuits(candidates, now)
+	if logWarn != nil {
+		logWarn.Printf(
+			"Worker candidates unavailable reason=all_workers_circuit_open configured_workers=%d available_workers=%d quota_exhausted_workers=%d temporary_failed_workers=%d other_blocked_workers=%d next_retry_at=%s",
+			summary.Configured,
+			summary.Available,
+			summary.QuotaExhausted,
+			summary.TemporaryFailed,
+			summary.OtherBlocked,
+			summary.nextRetryField(),
+		)
+	}
+	return candidates[:1], start
 }
 
 func workerStickyCandidateIndex(sessionID string, candidateCount int) int {
