@@ -2,11 +2,12 @@ import baseWorker from "./worker.js";
 import { connect } from "cloudflare:sockets";
 import { DurableObject } from "cloudflare:workers";
 
-const REVISION = "chunk-relay-mtproto-v4";
+const REVISION = "chunk-relay-mtproto-v5";
 const RELAY_MAX_CHUNK_BYTES = 8 * 1024;
 const DIAG_MAX_CHUNK_BYTES = 12 * 1024;
 const MAX_QUEUE_BYTES = 2 * 1024 * 1024;
 const MAX_POLL_WAIT_MS = 6000;
+const MAX_UPLOAD_REORDER_WINDOW = 16;
 
 function headers(extra = {}) {
   return { "Cache-Control": "no-store", "X-Tgws-Chunk-Relay-Revision": REVISION, ...extra };
@@ -23,6 +24,16 @@ function validTarget(value) {
   return target.length >= 3 && target.length <= 64 && /^[0-9A-Fa-f:.]+$/.test(target);
 }
 
+function deferred() {
+  let resolve;
+  let reject;
+  const promise = new Promise((res, rej) => {
+    resolve = res;
+    reject = rej;
+  });
+  return { promise, resolve, reject };
+}
+
 export class ChunkRelaySession extends DurableObject {
   constructor(ctx, env) {
     super(ctx, env);
@@ -34,6 +45,7 @@ export class ChunkRelaySession extends DurableObject {
     this.upChain = Promise.resolve();
     this.upSeq = 0;
     this.upBytes = 0;
+    this.upPending = new Map();
     this.downSeq = 0;
     this.downBytes = 0;
     this.pending = null;
@@ -52,6 +64,11 @@ export class ChunkRelaySession extends DurableObject {
   wakeDrain() {
     for (const resolve of this.drainWaiters) resolve();
     this.drainWaiters.clear();
+  }
+
+  rejectPendingUploads(error) {
+    for (const entry of this.upPending.values()) entry.done.reject(error);
+    this.upPending.clear();
   }
 
   async waitForDrain() {
@@ -82,6 +99,7 @@ export class ChunkRelaySession extends DurableObject {
       this.pump().catch((error) => {
         console.log("chunk relay pump failed", { revision: REVISION, target, error: String(error) });
         this.closed = true;
+        this.rejectPendingUploads(error);
         this.wake();
         this.wakeDrain();
       });
@@ -99,6 +117,7 @@ export class ChunkRelaySession extends DurableObject {
       const { value, done } = await this.reader.read();
       if (done) {
         this.closed = true;
+        this.rejectPendingUploads(new Error("upstream_closed"));
         this.wake();
         this.wakeDrain();
         return;
@@ -127,31 +146,81 @@ export class ChunkRelaySession extends DurableObject {
     });
   }
 
+  async drainUploads() {
+    while (!this.closed) {
+      const nextSeq = this.upSeq + 1;
+      const entry = this.upPending.get(nextSeq);
+      if (!entry) return;
+
+      try {
+        await this.writer.write(entry.data);
+      } catch (error) {
+        this.closed = true;
+        entry.done.reject(error);
+        this.upPending.delete(nextSeq);
+        this.rejectPendingUploads(error);
+        this.wake();
+        this.wakeDrain();
+        throw error;
+      }
+
+      this.upPending.delete(nextSeq);
+      this.upSeq = nextSeq;
+      this.upBytes += entry.data.byteLength;
+      entry.done.resolve();
+      if (nextSeq <= 2 || this.upBytes % (64 * 1024) < entry.data.byteLength) {
+        console.log("chunk relay up", {
+          revision: REVISION,
+          target: this.target,
+          seq: nextSeq,
+          bytes: entry.data.byteLength,
+          up_bytes: this.upBytes,
+          pending_uploads: this.upPending.size,
+        });
+      }
+    }
+  }
+
   async handleUp(request, url) {
     const seq = Number.parseInt(url.searchParams.get("seq") || "0", 10);
     if (!Number.isSafeInteger(seq) || seq <= 0) return new Response("bad seq", { status: 400, headers: headers() });
-    if (!this.socket && this.upSeq === 0 && seq > 1) return new Response("session lost", { status: 410, headers: headers() });
+    if (!this.socket && this.upSeq === 0 && seq > MAX_UPLOAD_REORDER_WINDOW) {
+      return new Response("session lost", { status: 410, headers: headers() });
+    }
 
-    const run = async () => {
+    const body = new Uint8Array(await request.arrayBuffer());
+    if (!body.byteLength || body.byteLength > RELAY_MAX_CHUNK_BYTES) {
+      return new Response("bad size", { status: 413, headers: headers() });
+    }
+
+    const admit = async () => {
       await this.ensureSocket(url.searchParams.get("dst"));
-      if (seq <= this.upSeq) {
-        return new Response(null, { status: 204, headers: headers({ "X-Tgws-Chunk-Ack": String(seq) }) });
+      if (seq <= this.upSeq) return { immediate: true };
+      if (seq > this.upSeq + MAX_UPLOAD_REORDER_WINDOW) return { status: 409 };
+
+      let entry = this.upPending.get(seq);
+      if (!entry) {
+        entry = { data: body, done: deferred() };
+        this.upPending.set(seq, entry);
       }
-      if (seq !== this.upSeq + 1) return new Response("sequence gap", { status: 409, headers: headers() });
-      const body = new Uint8Array(await request.arrayBuffer());
-      if (!body.byteLength || body.byteLength > RELAY_MAX_CHUNK_BYTES) return new Response("bad size", { status: 413, headers: headers() });
-      await this.writer.write(body);
-      this.upSeq = seq;
-      this.upBytes += body.byteLength;
-      if (seq <= 2 || this.upBytes % (64 * 1024) < body.byteLength) {
-        console.log("chunk relay up", { revision: REVISION, target: this.target, seq, bytes: body.byteLength, up_bytes: this.upBytes });
-      }
-      return new Response(null, { status: 204, headers: headers({ "X-Tgws-Chunk-Ack": String(seq) }) });
+
+      await this.drainUploads();
+      return { entry };
     };
 
-    const result = this.upChain.then(run, run);
-    this.upChain = result.then(() => undefined, () => undefined);
-    return result;
+    const admittedPromise = this.upChain.then(admit, admit);
+    this.upChain = admittedPromise.then(() => undefined, () => undefined);
+    const admitted = await admittedPromise;
+
+    if (admitted.immediate) {
+      return new Response(null, { status: 204, headers: headers({ "X-Tgws-Chunk-Ack": String(seq) }) });
+    }
+    if (admitted.status) {
+      return new Response("sequence window", { status: admitted.status, headers: headers() });
+    }
+
+    await admitted.entry.done.promise;
+    return new Response(null, { status: 204, headers: headers({ "X-Tgws-Chunk-Ack": String(seq) }) });
   }
 
   async fetch(request) {
@@ -196,6 +265,7 @@ export class ChunkRelaySession extends DurableObject {
 
       if (action === "close") {
         this.closed = true;
+        this.rejectPendingUploads(new Error("session_closed"));
         this.wake();
         this.wakeDrain();
         try { await this.socket?.close(); } catch {}
