@@ -48,7 +48,7 @@ class MtProtoRuntimeAdapterTest {
         assertEquals("1:149.154.175.50", runtimeConfig.dcIps)
         assertEquals("", runtimeConfig.fakeTlsDomain)
         assertFalse(runtimeConfig.fakeTlsPassthrough)
-        assertTrue(runtimeConfig.mtProtoWorkerPreconnect)
+        assertFalse(runtimeConfig.mtProtoWorkerPreconnect)
         assertEquals(1, runtimeConfig.verbose)
         assertNull(result.errorCode)
     }
@@ -77,6 +77,7 @@ class MtProtoRuntimeAdapterTest {
                 dcIps = "1:149.154.175.50",
                 fakeTlsDomain = "www.google.com",
                 fakeTlsPassthrough = true,
+                mtProtoWorkerPreconnect = true,
             ).normalized(),
         )
 
@@ -97,7 +98,7 @@ class MtProtoRuntimeAdapterTest {
         assertEquals(MtProtoSecretMasking.MASKED, fields["secret"])
         assertEquals("no", fields["fakeTls"])
         assertEquals("no", fields["fakeTlsPassthrough"])
-        assertEquals("yes", fields["mtProtoWorkerPreconnect"])
+        assertEquals("no", fields["mtProtoWorkerPreconnect"])
         assertFalse(fields.values.any { it.contains(fixedSecret) })
     }
 

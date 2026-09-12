@@ -1,12 +1,12 @@
 package com.amurcanov.tgwsproxy
 
-import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class ProxyRuntimeConfigFactoryTest {
     @Test
-    fun withRuntimeWorkerFallbackRoutes_expandsWorkerOnlyFallbackPolicy() {
+    fun runtimePolicy_workerOnlyWithFallbackDoesNotEnableDisabledRoutes() {
         val policy = NetworkRoutePolicy(
             networkType = NetworkProfileType.WIFI,
             enabledRoutes = setOf(RouteKind.WORKER_WS),
@@ -15,17 +15,29 @@ class ProxyRuntimeConfigFactoryTest {
             allowFallback = true,
         )
 
-        val runtimePolicy = policy.withRuntimeWorkerFallbackRoutes()
+        val raw = ConnectionRuntimeConfig.buildRuntimeTokens(
+            dcEntries = listOf("2:149.154.167.220"),
+            mode = ConnectionMode.WorkerFirst,
+            cfProxyEnabled = true,
+            cfProxyPriority = true,
+            cfProxyOnly = false,
+            cfDomain = "",
+            workerEnabled = true,
+            workerDomain = "example.username.workers.dev",
+            routePolicy = policy,
+        )
 
-        assertEquals(RouteKind.WORKER_WS, runtimePolicy.preferredRoute)
-        assertEquals(AutoStrategy.WORKER_PREFERRED, runtimePolicy.autoStrategy)
-        assertTrue(RouteKind.WORKER_WS in runtimePolicy.enabledRoutes)
-        assertTrue(RouteKind.CF_PROXY_WS in runtimePolicy.enabledRoutes)
-        assertTrue(RouteKind.TCP_FALLBACK in runtimePolicy.enabledRoutes)
+        assertTrue(raw.contains("@route_worker_ws=1"))
+        assertTrue(raw.contains("@route_fallback=1"))
+        assertTrue(raw.contains("@cfproxy=0"))
+        assertTrue(raw.contains("@route_cf_proxy_ws=0"))
+        assertTrue(raw.contains("@route_tcp_fallback=0"))
+        assertFalse(raw.contains("@route_cf_proxy_ws=1"))
+        assertFalse(raw.contains("@route_tcp_fallback=1"))
     }
 
     @Test
-    fun withRuntimeWorkerFallbackRoutes_keepsStrictWorkerOnlyPolicy() {
+    fun runtimePolicy_strictWorkerOnlyKeepsDisabledRoutesDisabled() {
         val policy = NetworkRoutePolicy(
             networkType = NetworkProfileType.WIFI,
             enabledRoutes = setOf(RouteKind.WORKER_WS),
@@ -34,6 +46,22 @@ class ProxyRuntimeConfigFactoryTest {
             allowFallback = false,
         )
 
-        assertEquals(policy, policy.withRuntimeWorkerFallbackRoutes())
+        val raw = ConnectionRuntimeConfig.buildRuntimeTokens(
+            dcEntries = listOf("2:149.154.167.220"),
+            mode = ConnectionMode.WorkerOnly,
+            cfProxyEnabled = true,
+            cfProxyPriority = true,
+            cfProxyOnly = false,
+            cfDomain = "",
+            workerEnabled = true,
+            workerDomain = "example.username.workers.dev",
+            routePolicy = policy,
+        )
+
+        assertTrue(raw.contains("@route_worker_ws=1"))
+        assertTrue(raw.contains("@route_fallback=0"))
+        assertTrue(raw.contains("@cfproxy=0"))
+        assertTrue(raw.contains("@route_cf_proxy_ws=0"))
+        assertTrue(raw.contains("@route_tcp_fallback=0"))
     }
 }

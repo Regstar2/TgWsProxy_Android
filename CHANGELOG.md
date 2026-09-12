@@ -1,6 +1,16 @@
-﻿# Changelog
+# Changelog
 
 All notable user-facing changes are listed here. Detailed notes for older releases: [docs/releases/](docs/releases/).
+
+## 1.10.14 - Unreleased
+- MTProto Worker traffic can use a fresh-HTTPS chunk relay instead of one long-lived `workers.dev` WebSocket, preserving the Telegram TCP session inside a Cloudflare Durable Object.
+- The stabilized relay profile uses 12 KiB upload chunks, a sliding upload window of 3, ordered sequence acknowledgements, bounded retries, downstream long-polling and queue backpressure.
+- `ROUND_ROBIN` now assigns each MTProto session to one Worker by a stable opaque session id; all chunks of that session stay on the same Worker while different sessions can be distributed across the pool.
+- Worker revision `chunk-relay-mtproto-v7` reports Durable Objects Free Tier duration exhaustion as a recoverable HTTP 503 with quota-reset metadata.
+- Native Worker routing keeps a per-domain circuit breaker: quota-exhausted Workers are skipped until reset, transient 5xx failures receive a short cooldown, and new sessions fail over to another enabled Worker automatically.
+- Worker preconnect is disabled for the MTProto Worker path, and an explicit Worker-only route policy remains Worker-only instead of silently adding direct/TCP fallback routes.
+- PR CI now includes Go race tests and Cloudflare Worker handler tests for the stabilized transport.
+- Known limitation: the Worker route is functional but slower than direct connectivity and remains dependent on Cloudflare Durable Objects quotas; it is not promoted to the default route in this release candidate.
 
 ## 1.10.13 - 2026-08-26
 - MTProto WebSocket receive path now reassembles fragmented/continuation messages instead of dropping continuation frames.
@@ -148,4 +158,3 @@ All notable user-facing changes are listed here. Detailed notes for older releas
 - “Recommended” preset in route policy UI.
 
 Earlier versions: see [docs/releases/](docs/releases/).
-

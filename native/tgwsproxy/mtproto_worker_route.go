@@ -112,7 +112,7 @@ func (c *mtProtoRouteConnector) Connect(
 		}
 		if logInfo != nil {
 			logInfo.Printf("MTProto route candidate failed route=%s selected_backend=%s reason=%s error=%v",
-				route, selectedBackend, mtProtoStatusField(result.Reason), lastErr)
+				route, selectedBackend, mtProtoStatusField(lastResult.Reason), lastErr)
 		}
 	}
 
@@ -203,14 +203,16 @@ func mtProtoStatusField(value string) string {
 }
 
 type mtProtoWorkerConnector struct {
-	dial mtProtoWorkerDial
+	dial           mtProtoWorkerDial
+	dialContext    func(context.Context, string, string, string) (mtProtoFrameSocket, error)
+	flowsealParity bool
 }
 
 func newMtProtoWorkerConnector() *mtProtoWorkerConnector {
 	return &mtProtoWorkerConnector{
-		dial: func(domain, path, logPrefix string) (mtProtoFrameSocket, error) {
-			return dialWorkerCandidate(domain, path, logPrefix)
-		},
+		dial:           dialFlowsealWorkerCandidate,
+		dialContext:    dialFlowsealWorkerCandidateContext,
+		flowsealParity: true,
 	}
 }
 
@@ -222,7 +224,7 @@ func (c *mtProtoWorkerConnector) Capability() mtproxyfrontend.OutboundCapability
 }
 
 func (c *mtProtoWorkerConnector) Connect(
-	_ context.Context,
+	ctx context.Context,
 	request mtproxyfrontend.OutboundRequest,
 ) (net.Conn, mtproxyfrontend.OutboundResult) {
 	result := mtproxyfrontend.OutboundResult{
@@ -237,17 +239,72 @@ func (c *mtProtoWorkerConnector) Connect(
 	}
 
 	settings := getRuntimeSettings()
-	candidates := settings.Worker.Failover.effectiveCandidates(settings.Worker.Domain)
+	// The frontend and Worker connector independently derive the same opaque
+	// identifier from relay_init, so Worker selection is deterministic for the
+	// lifetime of this Telegram session without exposing relay key material.
+	sessionID := mtproxyfrontend.SessionIDForRequest(request)
+	candidates, stickyIndex := workerCandidatesForSession(
+		settings.Worker.Failover,
+		settings.Worker.Domain,
+		sessionID,
+	)
 	if len(candidates) == 0 {
 		result.Reason = "worker_not_configured"
 		result.Err = fmt.Errorf("MTProto Worker backend is not configured")
 		return nil, result
 	}
-	target := fallbackTarget(request.DCID, "")
-	if target == "" {
+	if logInfo != nil {
+		logInfo.Printf(
+			"MTProto Worker session selection session_id=%s strategy=%s candidate_count=%d sticky_index=%d primary_worker_id=%s primary_worker_host=%s",
+			sessionID,
+			mtProtoStatusField(settings.Worker.Failover.SelectionStrategy),
+			len(candidates),
+			stickyIndex,
+			candidates[0].ID,
+			candidates[0].Domain,
+		)
+	}
+
+	destination := buildMtProtoWorkerDestinationPlan(
+		candidates[0].Domain,
+		request.DCID,
+		request.IsMedia,
+		settings,
+	)
+	target := strings.TrimSpace(destination.WorkerDst)
+	effectiveDC := destination.EffectiveDC
+	effectiveMedia := destination.EffectiveIsMedia
+	if !destination.OK || target == "" || effectiveDC <= 0 {
 		result.Reason = "dc_target_unavailable"
-		result.Err = fmt.Errorf("no Worker target for dc %d", request.DCID)
+		result.Err = fmt.Errorf(
+			"no Worker destination for dc %d: %s",
+			request.DCID,
+			mtProtoStatusField(destination.FailReason),
+		)
 		return nil, result
+	}
+
+	workerRelayInit := request.RelayInit
+	// A Flowseal media fix changes only the physical Worker destination.
+	// Rewriting relay_init from -DC2 to -DC4 makes Telegram treat the stream
+	// as a different logical DC and causes the media session to close.
+	if !destination.FlowsealMediaFixApplied &&
+		(effectiveDC != request.DCID || effectiveMedia != request.IsMedia) {
+		signedDC := effectiveDC
+		if effectiveMedia {
+			signedDC = -effectiveDC
+		}
+		workerRelayInit = patchInitDC(request.RelayInit, signedDC)
+		patchedDC, patchedMedia, ok := dcFromInit(workerRelayInit)
+		if !ok || patchedDC != effectiveDC || patchedMedia != effectiveMedia {
+			result.Reason = "worker_relay_init_destination_mismatch"
+			result.Err = fmt.Errorf(
+				"Worker relay init destination mismatch: dc=%d media=%t",
+				effectiveDC,
+				effectiveMedia,
+			)
+			return nil, result
+		}
 	}
 
 	maxAttempts := settings.Worker.Failover.maxAttemptsFor(len(candidates))
@@ -257,12 +314,16 @@ func (c *mtProtoWorkerConnector) Connect(
 		return nil, result
 	}
 
-	sessionID := newWorkerSessionID()
 	var lastErr error
 	var lastReason string
 	for i := 0; i < maxAttempts; i++ {
+		if err := ctx.Err(); err != nil {
+			result.Err = err
+			result.Reason = "cancelled"
+			return nil, result
+		}
 		candidate := candidates[i]
-		path := buildWorkerWSPath(request.DCID, target, request.IsMedia, sessionID)
+		path := buildWorkerWSPath(effectiveDC, target, effectiveMedia, sessionID)
 		prefix := fmt.Sprintf(
 			"[MTProto] session_id=%s DC%d%s cfworker",
 			sessionID,
@@ -271,49 +332,93 @@ func (c *mtProtoWorkerConnector) Connect(
 		)
 		if logInfo != nil {
 			logInfo.Printf(
-				"MTProto route truth frontend=MTProto selected_backend=%s actual_backend=none fallback_used=false reason=connecting dc=%d media=%t transport=%s worker_host=%s worker_dst=%s attempt=%d",
+				"MTProto route truth frontend=MTProto session_id=%s signed_dc=%d selected_backend=%s actual_backend=none fallback_used=false reason=connecting dc=%d media=%t effective_dc=%d effective_media=%t transport=%s worker_host=%s worker_dst=%s destination_mode=%s effective_destination_mode=%s attempt=%d",
+				sessionID,
+				request.SignedDC,
 				mtProtoWorkerBackend,
 				request.DCID,
 				request.IsMedia,
+				effectiveDC,
+				effectiveMedia,
 				request.Transport,
 				candidate.Domain,
 				target,
+				destination.ConfiguredDestinationMode,
+				destination.EffectiveDestinationMode,
 				i+1,
 			)
 		}
 
-		poolKey := WorkerPoolKey{
-			DC:           request.DCID,
-			WorkerDomain: candidate.Domain,
-			Dst:          target,
-			Media:        request.IsMedia,
-		}
 		var ws mtProtoFrameSocket
 		var err error
-		if pooled := workerPool.GetForSession(poolKey); pooled != nil {
-			ws = pooled
+		if c.flowsealParity {
 			if logInfo != nil {
 				logInfo.Printf(
-					"MTProto Worker WS preconnect hit dc=%d media=%t worker_host=%s worker_dst=%s attempt=%d",
-					request.DCID,
-					request.IsMedia,
+					"MTProto Worker Flowseal parity fresh dial session_id=%s signed_dc=%d dc=%d media=%t worker_host=%s worker_dst=%s preconnect_bypassed=true attempt=%d",
+					sessionID,
+					request.SignedDC,
+					effectiveDC,
+					effectiveMedia,
 					candidate.Domain,
 					target,
 					i+1,
 				)
+			}
+			if c.dialContext != nil {
+				ws, err = c.dialContext(ctx, candidate.Domain, path, prefix)
+			} else {
+				ws, err = c.dial(candidate.Domain, path, prefix)
 			}
 		} else {
-			if logInfo != nil && workerWsPreconnectActive() {
-				logInfo.Printf(
-					"MTProto Worker WS preconnect miss dc=%d media=%t worker_host=%s worker_dst=%s attempt=%d",
-					request.DCID,
-					request.IsMedia,
-					candidate.Domain,
-					target,
-					i+1,
-				)
+			poolKey := WorkerPoolKey{
+				DC:           effectiveDC,
+				WorkerDomain: candidate.Domain,
+				Dst:          target,
+				Media:        effectiveMedia,
 			}
-			ws, err = c.dial(candidate.Domain, path, prefix)
+			if pooled := workerPool.GetForSession(poolKey); pooled != nil {
+				ws = pooled
+				if logInfo != nil {
+					logInfo.Printf(
+						"MTProto Worker WS preconnect hit session_id=%s signed_dc=%d dc=%d media=%t worker_host=%s worker_dst=%s attempt=%d",
+						sessionID,
+						request.SignedDC,
+						effectiveDC,
+						effectiveMedia,
+						candidate.Domain,
+						target,
+						i+1,
+					)
+				}
+			} else {
+				preconnectEnabled := workerWsPreconnectActive()
+				if logInfo != nil && preconnectEnabled {
+					logInfo.Printf(
+						"MTProto Worker WS preconnect miss session_id=%s signed_dc=%d dc=%d media=%t worker_host=%s worker_dst=%s attempt=%d",
+						sessionID,
+						request.SignedDC,
+						effectiveDC,
+						effectiveMedia,
+						candidate.Domain,
+						target,
+						i+1,
+					)
+				}
+				if logInfo != nil {
+					logInfo.Printf(
+						"MTProto Worker WS fresh dial session_id=%s signed_dc=%d dc=%d media=%t worker_host=%s worker_dst=%s preconnect_enabled=%t attempt=%d",
+						sessionID,
+						request.SignedDC,
+						effectiveDC,
+						effectiveMedia,
+						candidate.Domain,
+						target,
+						preconnectEnabled,
+						i+1,
+					)
+				}
+				ws, err = c.dial(candidate.Domain, path, prefix)
+			}
 		}
 		if err != nil {
 			lastErr = err
@@ -321,7 +426,15 @@ func (c *mtProtoWorkerConnector) Connect(
 			continue
 		}
 
-		stream, err := mtProtoWebSocketConn(ws, request.RelayInit, candidate.Domain)
+		stopCancel := context.AfterFunc(ctx, ws.Close)
+		stream, err := mtProtoWorkerWebSocketConn(ws, workerRelayInit, candidate.Domain)
+		stopCancel()
+		if ctx.Err() != nil {
+			ws.Close()
+			result.Err = ctx.Err()
+			result.Reason = "cancelled"
+			return nil, result
+		}
 		if err != nil {
 			ws.Close()
 			lastErr = err
@@ -330,6 +443,13 @@ func (c *mtProtoWorkerConnector) Connect(
 				lastReason = "packet_splitter_failed"
 			}
 			continue
+		}
+		if workerStream, ok := stream.(*mtProtoWebSocketStream); ok {
+			workerStream.sessionID = sessionID
+			workerStream.workerDst = target
+		}
+		if !c.flowsealParity {
+			stream = wrapMtProtoWorkerPayloadTrace(stream, request, sessionID, target)
 		}
 
 		result.ActualBackend = mtProtoWorkerBackend
@@ -354,14 +474,16 @@ func mtProtoWorkerConfigured() bool {
 }
 
 type mtProtoWebSocketStream struct {
-	socket   mtProtoFrameSocket
-	splitter *MsgSplitter
-	local    net.Addr
-	remote   net.Addr
-	readMu   sync.Mutex
-	readBuf  []byte
-	closeMu  sync.Mutex
-	closed   bool
+	socket    mtProtoFrameSocket
+	splitter  *MsgSplitter
+	local     net.Addr
+	remote    net.Addr
+	sessionID string
+	workerDst string
+	readMu    sync.Mutex
+	readBuf   []byte
+	closeMu   sync.Mutex
+	closed    bool
 }
 
 func (s *mtProtoWebSocketStream) Read(dst []byte) (int, error) {
@@ -382,6 +504,20 @@ func (s *mtProtoWebSocketStream) Read(dst []byte) (int, error) {
 }
 
 func (s *mtProtoWebSocketStream) Write(data []byte) (int, error) {
+	if len(data) == 0 {
+		return 0, nil
+	}
+
+	// A nil splitter is intentional for the Worker route. Flowseal forwards
+	// each transformed TCP read directly as one WebSocket message instead of
+	// buffering until an MTProto packet boundary is reconstructed.
+	if s.splitter == nil {
+		if err := s.socket.Send(data); err != nil {
+			return 0, err
+		}
+		return len(data), nil
+	}
+
 	parts := s.splitter.Split(data)
 	if len(parts) == 0 {
 		return len(data), nil
@@ -399,9 +535,8 @@ func (s *mtProtoWebSocketStream) Close() error {
 		return nil
 	}
 	s.closed = true
-	if tail := s.splitter.Flush(); len(tail) > 0 {
-		_ = s.socket.SendBatch(tail)
-	}
+	// Close is cancellation: do not flush an incomplete packet or wait on a
+	// blocked write. The writer owns splitter state until the socket is closed.
 	s.socket.Close()
 	return nil
 }
@@ -414,16 +549,32 @@ func (s *mtProtoWebSocketStream) RemoteAddr() net.Addr {
 	return s.remote
 }
 
-func (s *mtProtoWebSocketStream) SetDeadline(time.Time) error {
-	return nil
+func (s *mtProtoWebSocketStream) SetDeadline(t time.Time) error {
+	if socket, ok := s.socket.(interface{ SetDeadline(time.Time) error }); ok {
+		return socket.SetDeadline(t)
+	}
+	return fmt.Errorf("WebSocket transport does not support deadlines")
 }
 
-func (s *mtProtoWebSocketStream) SetReadDeadline(time.Time) error {
-	return nil
+func (s *mtProtoWebSocketStream) SetReadDeadline(t time.Time) error {
+	if socket, ok := s.socket.(interface{ SetReadDeadline(time.Time) error }); ok {
+		return socket.SetReadDeadline(t)
+	}
+	return fmt.Errorf("WebSocket transport does not support deadlines")
 }
 
-func (s *mtProtoWebSocketStream) SetWriteDeadline(time.Time) error {
-	return nil
+func (s *mtProtoWebSocketStream) SetWriteDeadline(t time.Time) error {
+	if socket, ok := s.socket.(interface{ SetWriteDeadline(time.Time) error }); ok {
+		return socket.SetWriteDeadline(t)
+	}
+	return fmt.Errorf("WebSocket transport does not support deadlines")
+}
+
+func (s *mtProtoWebSocketStream) RouteDiagnostics() mtproxyfrontend.RouteDiagnostics {
+	return mtproxyfrontend.RouteDiagnostics{
+		SessionID: strings.TrimSpace(s.sessionID),
+		WorkerDst: strings.TrimSpace(s.workerDst),
+	}
 }
 
 type mtProtoNetAddr string
@@ -437,6 +588,7 @@ func (a mtProtoNetAddr) String() string {
 }
 
 var (
-	_ net.Conn  = (*mtProtoWebSocketStream)(nil)
-	_ io.Closer = (*mtProtoWebSocketStream)(nil)
+	_ net.Conn                                 = (*mtProtoWebSocketStream)(nil)
+	_ io.Closer                                = (*mtProtoWebSocketStream)(nil)
+	_ mtproxyfrontend.RouteDiagnosticsProvider = (*mtProtoWebSocketStream)(nil)
 )

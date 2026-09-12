@@ -439,24 +439,58 @@ func (r *Runtime) handleConnection(ctx context.Context, conn net.Conn, config Co
 	if config.FakeTLSDomain != "" {
 		r.noteFakeTLSAccepted()
 	}
-	r.log("MTProto route request remote=%s dc=%d media=%t test_dc=%t transport=%s selected_backend=%s",
-		remote, request.DCID, request.IsMedia, request.IsTestDC, request.Transport, r.connector.Capability().SelectedBackend)
+
+	sessionID := SessionIDForRequest(request)
+	r.log("MTProto route request session_id=%s remote=%s signed_dc=%d dc=%d media=%t test_dc=%t transport=%s selected_backend=%s",
+		sessionID, remote, request.SignedDC, request.DCID, request.IsMedia, request.IsTestDC, request.Transport, r.connector.Capability().SelectedBackend)
 
 	outbound, result := r.connector.Connect(ctx, request)
 	r.updateRouteTruth(result)
 	if result.Err != nil || outbound == nil {
-		r.log("MTProto route failed frontend=MTProto selected_backend=%s actual_backend=%s fallback_used=%t reason=%s error=%v",
+		r.log("MTProto route failed frontend=MTProto session_id=%s signed_dc=%d dc=%d media=%t worker_dst=none selected_backend=%s actual_backend=%s fallback_used=%t reason=%s error=%v",
+			sessionID, request.SignedDC, request.DCID, request.IsMedia,
 			emptyStatusField(result.SelectedBackend), emptyStatusField(result.ActualBackend),
 			result.FallbackUsed, emptyStatusField(result.Reason), result.Err)
 		return
 	}
 	defer outbound.Close()
 
-	r.log("MTProto route connected frontend=MTProto selected_backend=%s actual_backend=%s fallback_used=%t reason=%s",
+	diagnostics := RouteDiagnosticsFor(outbound, request)
+	if diagnostics.SessionID != "" {
+		sessionID = diagnostics.SessionID
+	}
+	workerDst := emptyStatusField(diagnostics.WorkerDst)
+
+	r.log("MTProto route connected frontend=MTProto session_id=%s signed_dc=%d dc=%d media=%t worker_dst=%s selected_backend=%s actual_backend=%s fallback_used=%t reason=%s",
+		sessionID, request.SignedDC, request.DCID, request.IsMedia, workerDst,
 		result.SelectedBackend, result.ActualBackend, result.FallbackUsed, result.Reason)
-	bridgeTransformedStreams(ctx, clientConn, outbound, request.ClientToRelay, request.RelayToClient)
+	bridge := bridgeTransformedStreams(ctx, clientConn, outbound, request.ClientToRelay, request.RelayToClient)
+	bridgeError := "none"
+	if bridge.Err != nil {
+		bridgeError = sanitizeStatusField(bridge.Err.Error())
+	}
+	r.log(
+		"MTProto bridge closed frontend=MTProto session_id=%s signed_dc=%d dc=%d media=%t worker_dst=%s selected_backend=%s actual_backend=%s fallback_used=%t first_terminator=%s close_reason=%s up_bytes=%d down_bytes=%d up_chunks=%d down_chunks=%d duration_ms=%d error=%s",
+		sessionID,
+		request.SignedDC,
+		request.DCID,
+		request.IsMedia,
+		workerDst,
+		result.SelectedBackend,
+		result.ActualBackend,
+		result.FallbackUsed,
+		bridge.FirstTerminator,
+		bridge.CloseReason,
+		bridge.UpBytes,
+		bridge.DownBytes,
+		bridge.UpChunks,
+		bridge.DownChunks,
+		bridge.Duration.Milliseconds(),
+		bridgeError,
+	)
 	r.updateRouteTruth(OutboundResult{
 		SelectedBackend: result.SelectedBackend,
+		ActualBackend:   result.ActualBackend,
 		FallbackUsed:    result.FallbackUsed,
 		Reason:          "connection_closed",
 	})
@@ -551,38 +585,87 @@ func emptyStatusField(value string) string {
 	return value
 }
 
+type bridgeDirectionResult struct {
+	Direction string
+	Bytes     int64
+	Chunks    int64
+	Reason    string
+	Err       error
+}
+
+type bridgeResult struct {
+	UpBytes         int64
+	DownBytes       int64
+	UpChunks        int64
+	DownChunks      int64
+	FirstTerminator string
+	CloseReason     string
+	Err             error
+	Duration        time.Duration
+}
+
 func bridgeTransformedStreams(
 	ctx context.Context,
 	client net.Conn,
 	outbound net.Conn,
 	upTransform StreamTransform,
 	downTransform StreamTransform,
-) {
-	ctx, cancel := context.WithCancel(ctx)
+) bridgeResult {
+	started := time.Now()
+	bridgeCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
+	results := make(chan bridgeDirectionResult, 2)
 	go func() {
-		<-ctx.Done()
+		<-bridgeCtx.Done()
 		_ = client.Close()
 		_ = outbound.Close()
 	}()
 
 	var wg sync.WaitGroup
 	wg.Add(2)
-	go copyTransformed(&wg, cancel, outbound, client, upTransform)
-	go copyTransformed(&wg, cancel, client, outbound, downTransform)
+	go copyTransformed(&wg, bridgeCtx, results, "client_to_upstream", outbound, client, upTransform)
+	go copyTransformed(&wg, bridgeCtx, results, "upstream_to_client", client, outbound, downTransform)
+
+	first := <-results
+	cancel()
 	wg.Wait()
+	second := <-results
+
+	result := bridgeResult{
+		FirstTerminator: first.Direction,
+		CloseReason:     first.Reason,
+		Err:             first.Err,
+		Duration:        time.Since(started),
+	}
+	applyBridgeDirectionResult(&result, first)
+	applyBridgeDirectionResult(&result, second)
+	return result
+}
+
+func applyBridgeDirectionResult(result *bridgeResult, direction bridgeDirectionResult) {
+	if direction.Direction == "client_to_upstream" {
+		result.UpBytes = direction.Bytes
+		result.UpChunks = direction.Chunks
+		return
+	}
+	result.DownBytes = direction.Bytes
+	result.DownChunks = direction.Chunks
 }
 
 func copyTransformed(
 	wg *sync.WaitGroup,
-	cancel context.CancelFunc,
+	ctx context.Context,
+	results chan<- bridgeDirectionResult,
+	direction string,
 	dst io.Writer,
 	src io.Reader,
 	transform StreamTransform,
 ) {
 	defer wg.Done()
-	defer cancel()
+	outcome := bridgeDirectionResult{Direction: direction}
+	defer func() { results <- outcome }()
+
 	buf := make([]byte, 64*1024)
 	for {
 		n, err := src.Read(buf)
@@ -592,10 +675,27 @@ func copyTransformed(
 				chunk = transform(chunk)
 			}
 			if writeErr := writeFull(dst, chunk); writeErr != nil {
+				if ctx.Err() != nil {
+					outcome.Reason = "cancelled"
+				} else {
+					outcome.Reason = "write_error"
+					outcome.Err = writeErr
+				}
 				return
 			}
+			outcome.Bytes += int64(n)
+			outcome.Chunks++
 		}
 		if err != nil {
+			switch {
+			case errors.Is(err, io.EOF):
+				outcome.Reason = "eof"
+			case ctx.Err() != nil:
+				outcome.Reason = "cancelled"
+			default:
+				outcome.Reason = "read_error"
+				outcome.Err = err
+			}
 			return
 		}
 	}

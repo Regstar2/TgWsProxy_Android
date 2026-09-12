@@ -8,7 +8,7 @@ internal data class MtProtoRuntimeConfig(
     val fakeTlsDomain: String = "",
     val fakeTlsPassthrough: Boolean = false,
     val forceTestDc: Boolean = false,
-    val mtProtoWorkerPreconnect: Boolean = true,
+    val mtProtoWorkerPreconnect: Boolean = false,
     val verbose: Int = 1,
 ) {
     fun normalized(): MtProtoRuntimeConfig {

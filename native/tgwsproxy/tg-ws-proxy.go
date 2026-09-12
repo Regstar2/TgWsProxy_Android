@@ -1594,7 +1594,7 @@ var wsPool = newWsPool()
 
 var workerWsPreconnectEnabled = false
 
-const workerWsPreconnectMaxPerKey = 2
+const workerWsPreconnectMaxPerKey = 1
 
 func workerWsPreconnectActive() bool {
 	return workerWsPreconnectEnabled || getRuntimeSettings().MtProtoWorkerPreconnect
@@ -1621,11 +1621,6 @@ type WorkerPoolKey struct {
 	Media        bool
 }
 
-type workerWarmupTarget struct {
-	DC  int
-	Dst string
-}
-
 func workerWarmupDomains(settings runtimeSettings) []string {
 	candidates := settings.Worker.Failover.effectiveCandidates(settings.Worker.Domain)
 	if len(candidates) == 0 {
@@ -1647,32 +1642,37 @@ func workerWarmupDomains(settings runtimeSettings) []string {
 	return out
 }
 
-func workerWarmupTargets(dcOptMap map[int]string) []workerWarmupTarget {
-	seen := make(map[string]struct{})
-	out := make([]workerWarmupTarget, 0, 10)
-	add := func(dc int, dst string) {
-		dst = strings.TrimSpace(dst)
-		if dc <= 0 || dst == "" {
-			return
+// workerWarmupKeys derives preconnect keys through the same
+// WorkerDestinationPlan used by foreground MTProto Worker sessions.
+// Media is intentionally not warmed up: media/CDN sessions use a fresh dial
+// unless an exact media key was populated explicitly in the future.
+func workerWarmupKeys(settings runtimeSettings, workerDomains []string) []WorkerPoolKey {
+	seen := make(map[WorkerPoolKey]struct{})
+	out := make([]WorkerPoolKey, 0, len(workerDomains)*6)
+	for _, workerDomain := range workerDomains {
+		workerDomain = NormalizeWorkerDomain(workerDomain)
+		if workerDomain == "" {
+			continue
 		}
-		key := fmt.Sprintf("%d|%s", dc, dst)
-		if _, ok := seen[key]; ok {
-			return
+		for _, dc := range []int{1, 2, 3, 4, 5, 203} {
+			destination := buildMtProtoWorkerDestinationPlan(workerDomain, dc, false, settings)
+			target := strings.TrimSpace(destination.WorkerDst)
+			if !destination.OK || destination.EffectiveDC <= 0 || target == "" || destination.EffectiveIsMedia {
+				continue
+			}
+			key := WorkerPoolKey{
+				DC:           destination.EffectiveDC,
+				WorkerDomain: workerDomain,
+				Dst:          target,
+				Media:        false,
+			}
+			if _, ok := seen[key]; ok {
+				continue
+			}
+			seen[key] = struct{}{}
+			out = append(out, key)
 		}
-		seen[key] = struct{}{}
-		out = append(out, workerWarmupTarget{DC: dc, Dst: dst})
 	}
-
-	for _, dc := range []int{1, 2, 3, 4, 5, 203} {
-		add(dc, telegramDCTargetIP(dc, ""))
-		if dcOptMap != nil {
-			add(dc, dcOptMap[dc])
-		}
-	}
-	for _, candidate := range tgwsroute.DC2WorkerCandidates {
-		add(2, candidate)
-	}
-	add(tgwsroute.DefaultFlowsealMediaFixDC, tgwsroute.DefaultFlowsealMediaFixIP)
 	return out
 }
 
@@ -1703,11 +1703,36 @@ func (defaultWorkerPoolDialer) DialWorker(key WorkerPoolKey) (*RawWebSocket, err
 	return nil, lastErr
 }
 
+const workerWsReuseProbeTimeout = 2 * time.Millisecond
+
+// workerWebSocketReusable rejects preconnected sockets that are locally
+// closed, already have unexpected upstream data buffered, or whose peer has
+// already closed the connection. A read timeout means the idle socket is still
+// quiet and can be handed to a foreground MTProto session.
+func workerWebSocketReusable(ws *RawWebSocket) bool {
+	if ws == nil || ws.closed.Load() || ws.conn == nil || ws.bufReader == nil {
+		return false
+	}
+	if ws.bufReader.Buffered() > 0 {
+		return false
+	}
+
+	_ = ws.conn.SetReadDeadline(time.Now().Add(workerWsReuseProbeTimeout))
+	_, err := ws.bufReader.Peek(1)
+	_ = ws.conn.SetReadDeadline(time.Time{})
+	if err == nil {
+		return false
+	}
+	var netErr net.Error
+	return errors.As(err, &netErr) && netErr.Timeout()
+}
+
 type WorkerWsPool struct {
 	mu        sync.Mutex
 	idle      map[WorkerPoolKey][]poolEntry
 	refilling map[WorkerPoolKey]bool
 	dialer    workerPoolDialer
+	reusable  func(*RawWebSocket) bool
 	now       func() float64
 	maxAge    float64
 }
@@ -1720,6 +1745,7 @@ func newWorkerWsPool(dialer workerPoolDialer) *WorkerWsPool {
 		idle:      make(map[WorkerPoolKey][]poolEntry),
 		refilling: make(map[WorkerPoolKey]bool),
 		dialer:    dialer,
+		reusable:  workerWebSocketReusable,
 		now:       monoNow,
 		maxAge:    100.0,
 	}
@@ -1741,7 +1767,7 @@ func (p *WorkerWsPool) Get(key WorkerPoolKey) *RawWebSocket {
 		p.idle[key] = bucket
 
 		age := now - entry.created
-		if age > p.maxAge || entry.ws.closed.Load() {
+		if age > p.maxAge || !p.reusable(entry.ws) {
 			go entry.ws.Close()
 			continue
 		}
@@ -1790,35 +1816,22 @@ func (p *WorkerWsPool) refill(key WorkerPoolKey) {
 	}
 }
 
-func (p *WorkerWsPool) Warmup(dcOptMap map[int]string, workerDomains []string) {
+func (p *WorkerWsPool) Warmup(settings runtimeSettings, workerDomains []string) {
 	if !workerWsPreconnectActive() || workerWsPreconnectTargetSize() <= 0 || len(workerDomains) == 0 {
 		return
 	}
+	keys := workerWarmupKeys(settings, workerDomains)
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	started := 0
-	for _, workerDomain := range workerDomains {
-		workerDomain = NormalizeWorkerDomain(workerDomain)
-		if workerDomain == "" {
-			continue
-		}
-		for _, target := range workerWarmupTargets(dcOptMap) {
-			key := WorkerPoolKey{
-				DC:           target.DC,
-				WorkerDomain: workerDomain,
-				Dst:          target.Dst,
-				Media:        false,
-			}
-			p.scheduleRefillLocked(key)
-			started++
-		}
+	for _, key := range keys {
+		p.scheduleRefillLocked(key)
 	}
-	if started > 0 {
-		logInfo.Printf("Worker pool warmup scheduled for %d target(s) across %d worker(s)", started, len(workerDomains))
+	if len(keys) > 0 && logInfo != nil {
+		logInfo.Printf("Worker pool warmup scheduled for %d effective non-media target(s) across %d worker(s)", len(keys), len(workerDomains))
 	}
 }
 
-func (p *WorkerWsPool) Maintain(ctx context.Context, dcOptMap map[int]string, workerDomains []string) {
+func (p *WorkerWsPool) Maintain(ctx context.Context, settings runtimeSettings, workerDomains []string) {
 	ticker := time.NewTicker(poolMaintainInterval * time.Second)
 	defer ticker.Stop()
 	for {
@@ -1826,18 +1839,18 @@ func (p *WorkerWsPool) Maintain(ctx context.Context, dcOptMap map[int]string, wo
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			p.maintainOnce(dcOptMap, workerDomains)
+			p.maintainOnce(settings, workerDomains)
 		}
 	}
 }
 
-func (p *WorkerWsPool) maintainOnce(dcOptMap map[int]string, workerDomains []string) {
+func (p *WorkerWsPool) maintainOnce(settings runtimeSettings, workerDomains []string) {
 	now := p.now()
 	p.mu.Lock()
 	for key, bucket := range p.idle {
 		var fresh []poolEntry
 		for _, entry := range bucket {
-			if now-entry.created > p.maxAge || entry.ws.closed.Load() {
+			if now-entry.created > p.maxAge || !p.reusable(entry.ws) {
 				go entry.ws.Close()
 				continue
 			}
@@ -1846,7 +1859,7 @@ func (p *WorkerWsPool) maintainOnce(dcOptMap map[int]string, workerDomains []str
 		p.idle[key] = fresh
 	}
 	p.mu.Unlock()
-	p.Warmup(dcOptMap, workerDomains)
+	p.Warmup(settings, workerDomains)
 }
 
 func (p *WorkerWsPool) IdleCount() int {
@@ -2894,8 +2907,8 @@ func runProxy(ctx context.Context, host string, port int, dcOptMap map[int]strin
 	workerDomains := workerWarmupDomains(settings)
 	workerPreconnectActive := workerWsPreconnectActiveForSettings(settings)
 	if settings.workerRouteAvailable() && workerPreconnectActive && len(workerDomains) > 0 {
-		workerPool.Warmup(dcOptMap, workerDomains)
-		go workerPool.Maintain(srvCtx, dcOptMap, workerDomains)
+		workerPool.Warmup(settings, workerDomains)
+		go workerPool.Maintain(srvCtx, settings, workerDomains)
 		logInfo.Printf("  Worker WS preconnect enabled domains=%d", len(workerDomains))
 	} else {
 		logInfo.Printf("  Worker WS preconnect skipped enabled=%t route_available=%t domains=%d",
@@ -3253,8 +3266,8 @@ func startMtProtoWorkerPreconnect(dcOptMap map[int]string, settings runtimeSetti
 	mtProtoWorkerPreconnectStop = cancel
 	mtProtoWorkerPreconnectMu.Unlock()
 
-	workerPool.Warmup(dcOptMap, workerDomains)
-	go workerPool.Maintain(ctx, dcOptMap, workerDomains)
+	workerPool.Warmup(settings, workerDomains)
+	go workerPool.Maintain(ctx, settings, workerDomains)
 	if logInfo != nil {
 		logInfo.Printf("MTProto Worker WS preconnect enabled domains=%d", len(workerDomains))
 	}

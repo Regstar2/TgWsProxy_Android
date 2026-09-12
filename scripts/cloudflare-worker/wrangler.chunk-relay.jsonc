@@ -1,0 +1,20 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "tgproxy",
+  "main": "chunk-relay-worker.js",
+  "compatibility_date": "2026-09-12",
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "CHUNK_RELAY",
+        "class_name": "ChunkRelaySession"
+      }
+    ]
+  },
+  "exports": {
+    "ChunkRelaySession": {
+      "type": "durable-object",
+      "storage": "sqlite"
+    }
+  }
+}
