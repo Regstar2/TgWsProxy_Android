@@ -18,11 +18,18 @@ import (
 )
 
 const (
-	mtProtoChunkRelayBytes      = 8 * 1024
-	mtProtoChunkRelayMaxRetries = 3
-	mtProtoChunkRelayTimeout    = 12 * time.Second
-	mtProtoChunkRelayPollWaitMS = 900
+	mtProtoChunkRelayBytes       = 8 * 1024
+	mtProtoChunkRelayMaxRetries  = 3
+	mtProtoChunkRelayOpenTimeout = 10 * time.Second
+	mtProtoChunkRelayUpTimeout   = 5 * time.Second
+	mtProtoChunkRelayDownTimeout = 10 * time.Second
+	mtProtoChunkRelayPollWaitMS  = 6000
 )
+
+// Each relay request still uses a fresh TCP/TLS connection. Sharing only the
+// client-session cache allows TLS resumption without reintroducing a long-lived
+// workers.dev byte stream.
+var mtProtoChunkRelayTLSCache = tls.NewLRUClientSessionCache(256)
 
 type chunkRelayRequestFunc func(
 	ctx context.Context,
@@ -39,9 +46,9 @@ type mtProtoChunkRelayConn struct {
 	cancel    context.CancelFunc
 	lifeCtx   context.Context
 
-	writeMu   sync.Mutex
-	upSeq     int64
-	upBytes   int64
+	writeMu sync.Mutex
+	upSeq   int64
+	upBytes int64
 
 	readMu     sync.Mutex
 	readBuf    []byte
@@ -98,13 +105,16 @@ func dialMtProtoChunkRelay(
 
 	if logInfo != nil {
 		logInfo.Printf(
-			"%s MTProto Worker chunk relay ready session_id=%s worker_host=%s worker_dst=%s chunk_bytes=%d max_retries=%d revision=%s",
+			"%s MTProto Worker chunk relay ready session_id=%s worker_host=%s worker_dst=%s chunk_bytes=%d max_retries=%d poll_wait_ms=%d up_timeout_ms=%d down_timeout_ms=%d tls_session_cache=true revision=%s",
 			logPrefix,
 			sessionID,
 			domain,
 			workerDst,
 			mtProtoChunkRelayBytes,
 			mtProtoChunkRelayMaxRetries,
+			mtProtoChunkRelayPollWaitMS,
+			mtProtoChunkRelayUpTimeout.Milliseconds(),
+			mtProtoChunkRelayDownTimeout.Milliseconds(),
 			mtProtoStatusField(headers.Get("X-Tgws-Chunk-Relay-Revision")),
 		)
 	}
@@ -153,6 +163,7 @@ func (c *mtProtoChunkRelayConn) freshHTTPRequest(
 			InsecureSkipVerify: true, // Match the existing Flowseal Worker TLS policy in this experiment.
 			ServerName:         c.domain,
 			NextProtos:         []string{"http/1.1"},
+			ClientSessionCache: mtProtoChunkRelayTLSCache,
 		},
 	}
 	client := &http.Client{Transport: transport}
@@ -223,7 +234,14 @@ func (c *mtProtoChunkRelayConn) requestContext(parent context.Context, direction
 	base, baseCancel := context.WithCancel(parent)
 	stopLife := context.AfterFunc(c.lifeCtx, baseCancel)
 
-	deadline := time.Now().Add(mtProtoChunkRelayTimeout)
+	timeout := mtProtoChunkRelayOpenTimeout
+	switch direction {
+	case "up":
+		timeout = mtProtoChunkRelayUpTimeout
+	case "down":
+		timeout = mtProtoChunkRelayDownTimeout
+	}
+	deadline := time.Now().Add(timeout)
 	c.deadlineMu.RLock()
 	if direction == "up" && !c.writeDeadline.IsZero() && c.writeDeadline.Before(deadline) {
 		deadline = c.writeDeadline
