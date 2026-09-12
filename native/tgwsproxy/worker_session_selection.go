@@ -3,6 +3,7 @@ package main
 import (
 	"hash/fnv"
 	"strings"
+	"time"
 )
 
 const workerSelectionStrategyRoundRobin = "ROUND_ROBIN"
@@ -11,27 +12,27 @@ const workerSelectionStrategyRoundRobin = "ROUND_ROBIN"
 // strategies except ROUND_ROBIN. For ROUND_ROBIN, a stable hash of the opaque
 // session id rotates the candidate list once at session establishment. The
 // selected Worker therefore stays sticky for the whole session while different
-// sessions are spread across the configured Worker pool.
+// sessions are spread across the configured Worker pool. Workers with an open
+// runtime circuit are filtered after ordering so quota-exhausted endpoints do
+// not receive repeated connection attempts.
 func workerCandidatesForSession(
 	settings workerFailoverSettings,
 	fallbackDomain string,
 	sessionID string,
 ) ([]workerFailoverCandidate, int) {
 	candidates := settings.effectiveCandidates(fallbackDomain)
-	if len(candidates) <= 1 ||
-		!strings.EqualFold(strings.TrimSpace(settings.SelectionStrategy), workerSelectionStrategyRoundRobin) {
-		return candidates, 0
+	start := 0
+	if len(candidates) > 1 &&
+		strings.EqualFold(strings.TrimSpace(settings.SelectionStrategy), workerSelectionStrategyRoundRobin) {
+		start = workerStickyCandidateIndex(sessionID, len(candidates))
+		if start != 0 {
+			rotated := make([]workerFailoverCandidate, 0, len(candidates))
+			rotated = append(rotated, candidates[start:]...)
+			rotated = append(rotated, candidates[:start]...)
+			candidates = rotated
+		}
 	}
-
-	start := workerStickyCandidateIndex(sessionID, len(candidates))
-	if start == 0 {
-		return candidates, 0
-	}
-
-	rotated := make([]workerFailoverCandidate, 0, len(candidates))
-	rotated = append(rotated, candidates[start:]...)
-	rotated = append(rotated, candidates[:start]...)
-	return rotated, start
+	return filterWorkerCandidatesByCircuit(candidates, time.Now()), start
 }
 
 func workerStickyCandidateIndex(sessionID string, candidateCount int) int {
