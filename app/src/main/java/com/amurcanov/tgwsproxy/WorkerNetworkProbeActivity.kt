@@ -25,6 +25,7 @@ class WorkerNetworkProbeActivity : Activity() {
                     "okhttprandom",
                     "okhttpnocompressionrandom" -> OkHttpWorkerNetworkProbe.run(domain, family, transport)
                     "sslsocket" -> AndroidSslSocketWorkerNetworkProbe.run(domain, family)
+                    "freshhttp" -> FreshConnectionWorkerProbe.run(domain)
                     else -> NativeProxy.runWorkerNetworkProbe(domain, family, transport).orEmpty()
                 }
                 if (report.isEmpty()) {
