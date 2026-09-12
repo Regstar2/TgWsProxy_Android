@@ -25,6 +25,10 @@ const (
 	mtProtoChunkRelayUpHedgeDelay = 400 * time.Millisecond
 	mtProtoChunkRelayDownTimeout  = 10 * time.Second
 	mtProtoChunkRelayPollWaitMS   = 6000
+
+	chunkRelayWorkerStateHeader      = "X-Tgws-Worker-State"
+	chunkRelayQuotaResetHeader       = "X-Tgws-Quota-Reset"
+	chunkRelayQuotaExhaustedState    = "do-quota-exhausted"
 )
 
 // Each relay request still uses a fresh TCP/TLS connection. Sharing only the
@@ -65,6 +69,36 @@ type mtProtoChunkRelayConn struct {
 	closed  bool
 }
 
+func chunkRelayQuotaResetFromHeaders(headers http.Header, now time.Time) time.Time {
+	if headers != nil {
+		if raw := strings.TrimSpace(headers.Get(chunkRelayQuotaResetHeader)); raw != "" {
+			if parsed, err := time.Parse(time.RFC3339, raw); err == nil && parsed.After(now) {
+				return parsed
+			}
+		}
+		if raw := strings.TrimSpace(headers.Get("Retry-After")); raw != "" {
+			if seconds, err := strconv.Atoi(raw); err == nil && seconds > 0 {
+				return now.Add(time.Duration(seconds) * time.Second)
+			}
+		}
+	}
+	return nextWorkerQuotaReset(now)
+}
+
+func chunkRelayCircuitErrorForResponse(domain string, status int, headers http.Header, now time.Time) error {
+	if headers == nil || !strings.EqualFold(strings.TrimSpace(headers.Get(chunkRelayWorkerStateHeader)), chunkRelayQuotaExhaustedState) {
+		return nil
+	}
+	until := chunkRelayQuotaResetFromHeaders(headers, now)
+	markWorkerQuotaExhausted(domain, until)
+	return &workerCircuitOpenError{
+		Domain: domain,
+		Reason: workerCircuitReasonQuotaExhausted,
+		Until:  until,
+		Status: status,
+	}
+}
+
 func dialMtProtoChunkRelay(
 	ctx context.Context,
 	domain, sessionID, workerDst, logPrefix string,
@@ -74,6 +108,13 @@ func dialMtProtoChunkRelay(
 	workerDst = strings.TrimSpace(workerDst)
 	if domain == "" || sessionID == "" || workerDst == "" {
 		return nil, fmt.Errorf("chunk relay requires domain, session id and destination")
+	}
+	if state, blocked := activeWorkerCircuit(domain, time.Now()); blocked {
+		return nil, &workerCircuitOpenError{
+			Domain: domain,
+			Reason: state.Reason,
+			Until:  state.Until,
+		}
 	}
 
 	lifeCtx, cancel := context.WithCancel(context.Background())
@@ -97,12 +138,22 @@ func dialMtProtoChunkRelay(
 	}
 	if status != http.StatusNoContent {
 		cancel()
+		if status >= 500 {
+			until := markWorkerTemporaryFailure(domain, time.Now())
+			return nil, fmt.Errorf("open chunk relay: %w", &workerCircuitOpenError{
+				Domain: domain,
+				Reason: workerCircuitReasonTemporaryFailed,
+				Until:  until,
+				Status: status,
+			})
+		}
 		return nil, fmt.Errorf("open chunk relay: HTTP %d", status)
 	}
 	if strings.TrimSpace(headers.Get("X-Tgws-Chunk-Relay-Revision")) == "" {
 		cancel()
 		return nil, fmt.Errorf("open chunk relay: missing relay revision header")
 	}
+	clearWorkerCircuit(domain)
 
 	if logInfo != nil {
 		logInfo.Printf(
@@ -177,10 +228,14 @@ func (c *mtProtoChunkRelayConn) freshHTTPRequest(
 	}
 	defer resp.Body.Close()
 	responseBody, err := io.ReadAll(io.LimitReader(resp.Body, mtProtoChunkRelayBytes+4096))
+	headers := resp.Header.Clone()
 	if err != nil {
-		return resp.StatusCode, resp.Header.Clone(), nil, err
+		return resp.StatusCode, headers, nil, err
 	}
-	return resp.StatusCode, resp.Header.Clone(), responseBody, nil
+	if circuitErr := chunkRelayCircuitErrorForResponse(c.domain, resp.StatusCode, headers, time.Now()); circuitErr != nil {
+		return resp.StatusCode, headers, responseBody, circuitErr
+	}
+	return resp.StatusCode, headers, responseBody, nil
 }
 
 func (c *mtProtoChunkRelayConn) requestWithRetry(
@@ -206,6 +261,9 @@ func (c *mtProtoChunkRelayConn) requestWithRetry(
 		}
 		if err == nil {
 			return status, headers, responseBody, nil
+		}
+		if _, circuitOpen := workerCircuitError(err); circuitOpen {
+			return status, headers, responseBody, err
 		}
 		lastErr = err
 		if attempt >= mtProtoChunkRelayMaxRetries {
@@ -311,6 +369,10 @@ func (c *mtProtoChunkRelayConn) requestUpHedgeRound(
 					)
 				}
 				return result.status, result.headers, result.responseBody, nil
+			}
+			if _, circuitOpen := workerCircuitError(result.err); circuitOpen {
+				roundCancel()
+				return result.status, result.headers, result.responseBody, result.err
 			}
 			lastErr = result.err
 			if !hedgeLaunched {
@@ -546,6 +608,6 @@ func (c *mtProtoChunkRelayConn) RouteDiagnostics() mtproxyfrontend.RouteDiagnost
 }
 
 var (
-	_ net.Conn                                 = (*mtProtoChunkRelayConn)(nil)
+	_ net.Conn                                  = (*mtProtoChunkRelayConn)(nil)
 	_ mtproxyfrontend.RouteDiagnosticsProvider = (*mtProtoChunkRelayConn)(nil)
 )
