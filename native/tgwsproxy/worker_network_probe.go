@@ -23,6 +23,11 @@ const (
 	workerProbeIPv6   = "ipv6"
 )
 
+const (
+	workerProbeTransportGo   = "go"
+	workerProbeTransportUTLS = "utls"
+)
+
 var workerNetworkProbeSizes = []int{
 	1 * 1024,
 	4 * 1024,
@@ -49,11 +54,12 @@ type workerNetworkProbeCase struct {
 }
 
 type workerNetworkProbeReport struct {
-	Revision string                   `json:"revision"`
-	Domain   string                   `json:"domain"`
-	IPFamily string                   `json:"ip_family"`
-	Started  string                   `json:"started"`
-	Cases    []workerNetworkProbeCase `json:"cases"`
+	Revision  string                   `json:"revision"`
+	Domain    string                   `json:"domain"`
+	IPFamily  string                   `json:"ip_family"`
+	Transport string                   `json:"transport"`
+	Started   string                   `json:"started"`
+	Cases     []workerNetworkProbeCase `json:"cases"`
 }
 
 func normalizeWorkerProbeIPFamily(raw string) (string, bool) {
@@ -64,6 +70,17 @@ func normalizeWorkerProbeIPFamily(raw string) (string, bool) {
 		return workerProbeIPv4, true
 	case workerProbeIPv6, "6", "tcp6":
 		return workerProbeIPv6, true
+	default:
+		return "", false
+	}
+}
+
+func normalizeWorkerProbeTransport(raw string) (string, bool) {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "", workerProbeTransportGo:
+		return workerProbeTransportGo, true
+	case workerProbeTransportUTLS, "chrome", "chrome_auto":
+		return workerProbeTransportUTLS, true
 	default:
 		return "", false
 	}
@@ -87,14 +104,20 @@ func resolveWorkerProbeHost(ctx context.Context, domain, family string) (string,
 	return ips[0].String(), nil
 }
 
-func workerProbeOpen(domain, path, family string) (*flowsealRawWebSocket, error) {
+func workerProbeOpen(domain, path, family, transport string) (*flowsealRawWebSocket, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	host, err := resolveWorkerProbeHost(ctx, domain, family)
 	if err != nil {
 		return nil, err
 	}
-	ws, err := connectFlowsealRawWebSocketContext(ctx, host, domain, path, 10)
+	var ws *flowsealRawWebSocket
+	switch transport {
+	case workerProbeTransportUTLS:
+		ws, err = connectFlowsealRawWebSocketUTLSContext(ctx, host, domain, path, 10)
+	default:
+		ws, err = connectFlowsealRawWebSocketContext(ctx, host, domain, path, 10)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -102,12 +125,13 @@ func workerProbeOpen(domain, path, family string) (*flowsealRawWebSocket, error)
 	return ws, nil
 }
 
-func workerProbeCaseLog(c workerNetworkProbeCase) {
+func workerProbeCaseLog(c workerNetworkProbeCase, transport string) {
 	if logInfo == nil {
 		return
 	}
 	logInfo.Printf(
-		"Worker network probe mode=%s size_bytes=%d cumulative_bytes=%d ok=%t duration_ms=%d error=%s %s",
+		"Worker network probe transport=%s mode=%s size_bytes=%d cumulative_bytes=%d ok=%t duration_ms=%d error=%s %s",
+		transport,
 		c.Mode,
 		c.SizeBytes,
 		c.CumulativeBytes,
@@ -118,12 +142,12 @@ func workerProbeCaseLog(c workerNetworkProbeCase) {
 	)
 }
 
-func runEchoStaircase(domain, family string) []workerNetworkProbeCase {
-	path := "/diag/ws-echo?sid=probe-echo"
-	ws, err := workerProbeOpen(domain, path, family)
+func runEchoStaircase(domain, family, transport string) []workerNetworkProbeCase {
+	path := "/diag/ws-echo?sid=probe-" + transport + "-echo"
+	ws, err := workerProbeOpen(domain, path, family, transport)
 	if err != nil {
 		c := workerNetworkProbeCase{Mode: "echo_staircase_connect", Error: err.Error()}
-		workerProbeCaseLog(c)
+		workerProbeCaseLog(c, transport)
 		return []workerNetworkProbeCase{c}
 	}
 	defer ws.Close()
@@ -147,7 +171,7 @@ func runEchoStaircase(domain, family string) []workerNetworkProbeCase {
 				TransportState:  tcpTransportState(ws.conn),
 				Error:           sendErr.Error(),
 			}
-			workerProbeCaseLog(c)
+			workerProbeCaseLog(c, transport)
 			cases = append(cases, c)
 			break
 		}
@@ -167,7 +191,7 @@ func runEchoStaircase(domain, family string) []workerNetworkProbeCase {
 		} else {
 			c.OK = true
 		}
-		workerProbeCaseLog(c)
+		workerProbeCaseLog(c, transport)
 		cases = append(cases, c)
 		if !c.OK {
 			break
@@ -176,12 +200,12 @@ func runEchoStaircase(domain, family string) []workerNetworkProbeCase {
 	return cases
 }
 
-func runUpload4KStream(domain, family string) []workerNetworkProbeCase {
-	path := "/diag/upload?sid=probe-upload-4k"
-	ws, err := workerProbeOpen(domain, path, family)
+func runUpload4KStream(domain, family, transport string) []workerNetworkProbeCase {
+	path := "/diag/upload?sid=probe-" + transport + "-upload-4k"
+	ws, err := workerProbeOpen(domain, path, family, transport)
 	if err != nil {
 		c := workerNetworkProbeCase{Mode: "upload_4k_connect", Error: err.Error()}
-		workerProbeCaseLog(c)
+		workerProbeCaseLog(c, transport)
 		return []workerNetworkProbeCase{c}
 	}
 	defer ws.Close()
@@ -206,7 +230,7 @@ func runUpload4KStream(domain, family string) []workerNetworkProbeCase {
 				TransportState:  tcpTransportState(ws.conn),
 				Error:           err.Error(),
 			}
-			workerProbeCaseLog(c)
+			workerProbeCaseLog(c, transport)
 			cases = append(cases, c)
 			break
 		}
@@ -220,7 +244,7 @@ func runUpload4KStream(domain, family string) []workerNetworkProbeCase {
 				TransportState:  tcpTransportState(ws.conn),
 				Error:           err.Error(),
 			}
-			workerProbeCaseLog(c)
+			workerProbeCaseLog(c, transport)
 			cases = append(cases, c)
 			break
 		}
@@ -235,7 +259,7 @@ func runUpload4KStream(domain, family string) []workerNetworkProbeCase {
 				TransportState:  tcpTransportState(ws.conn),
 				Error:           "unexpected_ack",
 			}
-			workerProbeCaseLog(c)
+			workerProbeCaseLog(c, transport)
 			cases = append(cases, c)
 			break
 		}
@@ -248,22 +272,22 @@ func runUpload4KStream(domain, family string) []workerNetworkProbeCase {
 				DurationMS:      time.Since(started).Milliseconds(),
 				TransportState:  tcpTransportState(ws.conn),
 			}
-			workerProbeCaseLog(c)
+			workerProbeCaseLog(c, transport)
 			cases = append(cases, c)
 		}
 	}
 	return cases
 }
 
-func runDownloadSizes(domain, family string) []workerNetworkProbeCase {
+func runDownloadSizes(domain, family, transport string) []workerNetworkProbeCase {
 	cases := make([]workerNetworkProbeCase, 0, len(workerNetworkProbeSizes))
 	for _, size := range workerNetworkProbeSizes {
-		path := "/diag/download?size=" + fmt.Sprint(size) + "&sid=" + url.QueryEscape(fmt.Sprintf("probe-download-%d", size))
+		path := "/diag/download?size=" + fmt.Sprint(size) + "&sid=" + url.QueryEscape(fmt.Sprintf("probe-%s-download-%d", transport, size))
 		started := time.Now()
-		ws, err := workerProbeOpen(domain, path, family)
+		ws, err := workerProbeOpen(domain, path, family, transport)
 		if err != nil {
 			c := workerNetworkProbeCase{Mode: "download_single", SizeBytes: size, DurationMS: time.Since(started).Milliseconds(), Error: err.Error()}
-			workerProbeCaseLog(c)
+			workerProbeCaseLog(c, transport)
 			cases = append(cases, c)
 			break
 		}
@@ -282,7 +306,7 @@ func runDownloadSizes(domain, family string) []workerNetworkProbeCase {
 		} else {
 			c.OK = true
 		}
-		workerProbeCaseLog(c)
+		workerProbeCaseLog(c, transport)
 		cases = append(cases, c)
 		ws.Close()
 		if !c.OK {
@@ -292,14 +316,16 @@ func runDownloadSizes(domain, family string) []workerNetworkProbeCase {
 	return cases
 }
 
-func runWorkerNetworkProbe(domain, familyRaw string) workerNetworkProbeReport {
+func runWorkerNetworkProbe(domain, familyRaw, transportRaw string) workerNetworkProbeReport {
 	domain = NormalizeWorkerDomain(strings.TrimSpace(domain))
 	family, familyOK := normalizeWorkerProbeIPFamily(familyRaw)
+	transport, transportOK := normalizeWorkerProbeTransport(transportRaw)
 	report := workerNetworkProbeReport{
-		Revision: "worker-network-probe-v2",
-		Domain:   domain,
-		IPFamily: family,
-		Started:  time.Now().UTC().Format(time.RFC3339),
+		Revision:  "worker-network-probe-v3",
+		Domain:    domain,
+		IPFamily:  family,
+		Transport: transport,
+		Started:   time.Now().UTC().Format(time.RFC3339),
 	}
 	if domain == "" {
 		report.Cases = []workerNetworkProbeCase{{Mode: "validation", Error: "invalid_worker_domain"}}
@@ -310,14 +336,19 @@ func runWorkerNetworkProbe(domain, familyRaw string) workerNetworkProbeReport {
 		report.Cases = []workerNetworkProbeCase{{Mode: "validation", Error: "invalid_ip_family"}}
 		return report
 	}
-	if logInfo != nil {
-		logInfo.Printf("Worker network probe start domain=%s ip_family=%s revision=%s", domain, family, report.Revision)
+	if !transportOK {
+		report.Transport = strings.TrimSpace(transportRaw)
+		report.Cases = []workerNetworkProbeCase{{Mode: "validation", Error: "invalid_transport"}}
+		return report
 	}
-	report.Cases = append(report.Cases, runEchoStaircase(domain, family)...)
-	report.Cases = append(report.Cases, runUpload4KStream(domain, family)...)
-	report.Cases = append(report.Cases, runDownloadSizes(domain, family)...)
 	if logInfo != nil {
-		logInfo.Printf("Worker network probe complete domain=%s ip_family=%s cases=%d", domain, family, len(report.Cases))
+		logInfo.Printf("Worker network probe start domain=%s ip_family=%s transport=%s revision=%s", domain, family, transport, report.Revision)
+	}
+	report.Cases = append(report.Cases, runEchoStaircase(domain, family, transport)...)
+	report.Cases = append(report.Cases, runUpload4KStream(domain, family, transport)...)
+	report.Cases = append(report.Cases, runDownloadSizes(domain, family, transport)...)
+	if logInfo != nil {
+		logInfo.Printf("Worker network probe complete domain=%s ip_family=%s transport=%s cases=%d", domain, family, transport, len(report.Cases))
 	}
 	return report
 }
@@ -325,7 +356,7 @@ func runWorkerNetworkProbe(domain, familyRaw string) workerNetworkProbeReport {
 func encodeWorkerNetworkProbeReport(report workerNetworkProbeReport) *C.char {
 	encoded, err := json.Marshal(report)
 	if err != nil {
-		return C.CString(`{"revision":"worker-network-probe-v2","error":"json_encode_failed"}`)
+		return C.CString(`{"revision":"worker-network-probe-v3","error":"json_encode_failed"}`)
 	}
 	return C.CString(string(encoded))
 }
@@ -333,11 +364,17 @@ func encodeWorkerNetworkProbeReport(report workerNetworkProbeReport) *C.char {
 //export RunWorkerNetworkProbe
 func RunWorkerNetworkProbe(cDomain *C.char) *C.char {
 	initLogging(true)
-	return encodeWorkerNetworkProbeReport(runWorkerNetworkProbe(C.GoString(cDomain), workerProbeIPAuto))
+	return encodeWorkerNetworkProbeReport(runWorkerNetworkProbe(C.GoString(cDomain), workerProbeIPAuto, workerProbeTransportGo))
 }
 
 //export RunWorkerNetworkProbeWithFamily
 func RunWorkerNetworkProbeWithFamily(cDomain *C.char, cFamily *C.char) *C.char {
 	initLogging(true)
-	return encodeWorkerNetworkProbeReport(runWorkerNetworkProbe(C.GoString(cDomain), C.GoString(cFamily)))
+	return encodeWorkerNetworkProbeReport(runWorkerNetworkProbe(C.GoString(cDomain), C.GoString(cFamily), workerProbeTransportGo))
+}
+
+//export RunWorkerNetworkProbeWithFamilyAndTransport
+func RunWorkerNetworkProbeWithFamilyAndTransport(cDomain *C.char, cFamily *C.char, cTransport *C.char) *C.char {
+	initLogging(true)
+	return encodeWorkerNetworkProbeReport(runWorkerNetworkProbe(C.GoString(cDomain), C.GoString(cFamily), C.GoString(cTransport)))
 }
