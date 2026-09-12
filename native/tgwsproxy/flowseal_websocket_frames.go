@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -69,13 +70,9 @@ func (ws *flowsealRawWebSocket) sendFrame(frame []byte, payloadBytes int) error 
 		return ws.failureOr(net.ErrClosed)
 	}
 
-	// Keep application messages ordered; writeMu serializes data and control
-	// frames. Close must never wait for either lock.
 	ws.sendMu.Lock()
 	defer ws.sendMu.Unlock()
 
-	// Allocate the sequence before entering the potentially blocking transport
-	// write. This keeps the exact blocked attempt visible in #29 diagnostics.
 	sequence := ws.sendCount.Add(1)
 	trace := payloadBytes >= 64*1024 || sequence <= 2
 
@@ -110,7 +107,6 @@ func (ws *flowsealRawWebSocket) sendFrame(frame []byte, payloadBytes int) error 
 	ws.writeMu.Unlock()
 
 	if err != nil {
-		// A partial TLS/WebSocket write cannot be replayed on this stream.
 		ws.fail(err)
 		if logInfo != nil {
 			logInfo.Printf(
@@ -180,8 +176,6 @@ func (ws *flowsealRawWebSocket) Close() {
 		logInfo.Printf("MTProto Worker transport closed session_id=%s sent_bytes=%d recv_bytes=%d %s",
 			ws.logSessionID(), ws.sentBytes.Load(), ws.recvBytes.Load(), tcpTransportState(ws.conn))
 	}
-	// tls.Conn.Close can try to write close_notify for another five seconds
-	// after a failed Write. Cancellation must close the underlying transport.
 	conn := ws.conn
 	if wrapped, ok := conn.(interface{ NetConn() net.Conn }); ok {
 		conn = wrapped.NetConn()
@@ -249,7 +243,6 @@ func (ws *flowsealRawWebSocket) readFrame() (int, []byte, bool, error) {
 	return opcode, payload, fin, nil
 }
 
-// buildFlowsealFrame preserves one application message per frame, like Flowseal.
 func buildFlowsealFrame(opcode int, payload []byte, mask bool) []byte {
 	return buildFlowsealSingleFrame(opcode, payload, mask, true)
 }
