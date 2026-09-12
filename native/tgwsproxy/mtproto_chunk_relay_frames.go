@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"io"
 	"net"
 	"net/url"
 	"strings"
@@ -27,10 +28,32 @@ func dialMtProtoChunkRelayFrameSocket(ctx context.Context, domain, path, logPref
 	if err != nil {
 		return nil, err
 	}
+	if chunkConn, ok := conn.(*mtProtoChunkRelayConn); ok {
+		enableMtProtoChunkRelayRequestLimit(chunkConn)
+		if logInfo != nil {
+			logInfo.Printf(
+				"%s MTProto Worker chunk relay upload pipeline session_id=%s window=%d global_http_requests=%d",
+				logPrefix,
+				sessionID,
+				mtProtoChunkRelayUpWindow,
+				mtProtoChunkRelayGlobalHTTPRequests,
+			)
+		}
+	}
 	return &mtProtoChunkRelayFrameSocket{conn: conn}, nil
 }
 
 func (s *mtProtoChunkRelayFrameSocket) Send(data []byte) error {
+	if conn, ok := s.conn.(*mtProtoChunkRelayConn); ok {
+		n, err := writePipelinedMtProtoChunkRelay(conn, data)
+		if err != nil {
+			return err
+		}
+		if n != len(data) {
+			return io.ErrShortWrite
+		}
+		return nil
+	}
 	return writeFullConn(s.conn, data)
 }
 
