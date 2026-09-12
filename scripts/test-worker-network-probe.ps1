@@ -4,6 +4,8 @@ param(
     [string]$WorkerDomain,
     [ValidateSet("Auto", "IPv4", "IPv6")]
     [string]$IPFamily = "Auto",
+    [ValidateSet("Go", "OkHttp")]
+    [string]$Transport = "Go",
     [switch]$SkipBuild,
     [string]$DeviceSerial = "",
     [int]$TimeoutSeconds = 240
@@ -17,6 +19,7 @@ Set-Location $repoRoot
 $WorkerDomain = $WorkerDomain.Trim()
 if (-not $WorkerDomain) { throw "WorkerDomain is required." }
 $familyArg = $IPFamily.ToLowerInvariant()
+$transportArg = $Transport.ToLowerInvariant()
 
 $sdkCandidates = @(
     $env:ANDROID_SDK_ROOT,
@@ -61,8 +64,8 @@ if ($LASTEXITCODE -ne 0) { throw "APK installation failed." }
 $logDir = Join-Path $repoRoot "artifacts\worker-tests"
 New-Item -ItemType Directory -Force -Path $logDir | Out-Null
 $stamp = Get-Date -Format "yyyyMMdd-HHmmss"
-$runtimeLog = Join-Path $logDir "worker-network-probe-$familyArg-$stamp.txt"
-$metaLog = Join-Path $logDir "worker-network-probe-$familyArg-$stamp.meta.txt"
+$runtimeLog = Join-Path $logDir "worker-network-probe-$transportArg-$familyArg-$stamp.txt"
+$metaLog = Join-Path $logDir "worker-network-probe-$transportArg-$familyArg-$stamp.meta.txt"
 $commit = (& git rev-parse HEAD).Trim()
 $model = (& $adb -s $DeviceSerial shell getprop ro.product.model).Trim()
 $androidVersion = (& $adb -s $DeviceSerial shell getprop ro.build.version.release).Trim()
@@ -70,6 +73,7 @@ $androidVersion = (& $adb -s $DeviceSerial shell getprop ro.build.version.releas
     "commit=$commit",
     "worker_domain=$WorkerDomain",
     "ip_family=$familyArg",
+    "transport=$transportArg",
     "apk=$apk",
     "apk_sha256=$((Get-FileHash $apk -Algorithm SHA256).Hash)",
     "device=$model",
@@ -77,13 +81,14 @@ $androidVersion = (& $adb -s $DeviceSerial shell getprop ro.build.version.releas
     "skip_build=$SkipBuild"
 ) | Set-Content -Encoding UTF8 $metaLog
 
-Write-Host "IMPORTANT: deploy scripts/cloudflare-worker/worker.js from this branch to the same Worker first."
+Write-Host "IMPORTANT: diagnostic /diag/* endpoints must already be deployed to the same Worker."
 Write-Host "Running probe against: $WorkerDomain"
+Write-Host "Transport: $transportArg"
 Write-Host "IP family: $familyArg"
 
 & $adb -s $DeviceSerial logcat -c
 & $adb -s $DeviceSerial shell am force-stop com.amurcanov.tgwsproxy
-& $adb -s $DeviceSerial shell am start -n "com.amurcanov.tgwsproxy/.WorkerNetworkProbeActivity" --es domain $WorkerDomain --es family $familyArg
+& $adb -s $DeviceSerial shell am start -n "com.amurcanov.tgwsproxy/.WorkerNetworkProbeActivity" --es domain $WorkerDomain --es family $familyArg --es transport $transportArg
 if ($LASTEXITCODE -ne 0) { throw "Could not start WorkerNetworkProbeActivity." }
 
 $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
@@ -109,5 +114,5 @@ Write-Host "Runtime log: $runtimeLog"
 Write-Host "Metadata:    $metaLog"
 
 if (-not $complete) {
-    throw "Probe did not finish within $TimeoutSeconds seconds. Inspect $runtimeLog for the last successful size and TCP stall diagnostics."
+    throw "Probe did not finish within $TimeoutSeconds seconds. Inspect $runtimeLog for the last successful size and transport diagnostics."
 }
