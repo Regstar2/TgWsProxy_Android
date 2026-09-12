@@ -39,7 +39,7 @@ jobs:
         working-directory: native/tgwsproxy
         run: go test -race ./...
       - name: Deployed Worker handler tests
-        run: node --test scripts/cloudflare-worker/worker.test.mjs
+        run: node --test scripts/cloudflare-worker/*.test.mjs
 
   ci:
     name: Windows CI
