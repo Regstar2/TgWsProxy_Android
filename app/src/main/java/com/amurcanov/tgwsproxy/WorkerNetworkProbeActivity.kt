@@ -20,7 +20,10 @@ class WorkerNetworkProbeActivity : Activity() {
             try {
                 Log.i(TAG, "PROBE_START domain=$domain ip_family=$family transport=$transport")
                 val report = when (transport) {
-                    "okhttp" -> OkHttpWorkerNetworkProbe.run(domain, family)
+                    "okhttp",
+                    "okhttpnocompression",
+                    "okhttprandom",
+                    "okhttpnocompressionrandom" -> OkHttpWorkerNetworkProbe.run(domain, family, transport)
                     "sslsocket" -> AndroidSslSocketWorkerNetworkProbe.run(domain, family)
                     else -> NativeProxy.runWorkerNetworkProbe(domain, family, transport).orEmpty()
                 }
