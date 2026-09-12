@@ -241,7 +241,8 @@ object AndroidSslSocketWorkerNetworkProbe {
         connected.soTimeout = OP_TIMEOUT_MILLIS
 
         val sslSocket = try {
-            (SSLSocketFactory.getDefault().createSocket(connected, domain, 443, true) as SSLSocket).apply {
+            val sslFactory = SSLSocketFactory.getDefault() as SSLSocketFactory
+            (sslFactory.createSocket(connected, domain, 443, true) as SSLSocket).apply {
                 soTimeout = OP_TIMEOUT_MILLIS
                 val params = sslParameters
                 params.serverNames = listOf(SNIHostName(domain))
