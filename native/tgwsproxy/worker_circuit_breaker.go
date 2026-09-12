@@ -19,6 +19,22 @@ type workerCircuitState struct {
 	Until  time.Time
 }
 
+type workerCircuitSummary struct {
+	Configured       int
+	Available        int
+	QuotaExhausted   int
+	TemporaryFailed  int
+	OtherBlocked     int
+	NextRetry        time.Time
+}
+
+func (s workerCircuitSummary) nextRetryField() string {
+	if s.NextRetry.IsZero() {
+		return "unknown"
+	}
+	return s.NextRetry.UTC().Format(time.RFC3339)
+}
+
 type workerCircuitOpenError struct {
 	Domain string
 	Reason string
@@ -121,6 +137,29 @@ func workerCircuitError(err error) (*workerCircuitOpenError, bool) {
 		return target, true
 	}
 	return nil, false
+}
+
+func summarizeWorkerCandidateCircuits(candidates []workerFailoverCandidate, now time.Time) workerCircuitSummary {
+	summary := workerCircuitSummary{Configured: len(candidates)}
+	for _, candidate := range candidates {
+		state, blocked := activeWorkerCircuit(candidate.Domain, now)
+		if !blocked {
+			summary.Available++
+			continue
+		}
+		switch state.Reason {
+		case workerCircuitReasonQuotaExhausted:
+			summary.QuotaExhausted++
+		case workerCircuitReasonTemporaryFailed:
+			summary.TemporaryFailed++
+		default:
+			summary.OtherBlocked++
+		}
+		if !state.Until.IsZero() && (summary.NextRetry.IsZero() || state.Until.Before(summary.NextRetry)) {
+			summary.NextRetry = state.Until
+		}
+	}
+	return summary
 }
 
 func filterWorkerCandidatesByCircuit(candidates []workerFailoverCandidate, now time.Time) []workerFailoverCandidate {
