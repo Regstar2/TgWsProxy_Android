@@ -17,6 +17,7 @@ import java.net.Inet6Address
 import java.net.InetAddress
 import java.net.SocketTimeoutException
 import java.net.UnknownHostException
+import java.security.SecureRandom
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.TimeUnit
@@ -24,10 +25,10 @@ import java.util.concurrent.TimeUnit
 /**
  * Android-side A/B probe for issue #29.
  *
- * This deliberately exercises the same diagnostic Worker endpoints as the Go
- * probe, but uses OkHttp + Android's TLS provider instead of Go net/crypto/tls
- * and the hand-written WebSocket framing. Production proxy routing is not
- * changed by this class.
+ * All variants use the same OkHttp WebSocket implementation and Android TLS
+ * provider. The only controlled variables are outbound per-message compression
+ * and whether diagnostic payloads are deterministic/compressible or random.
+ * Production proxy routing is not changed by this class.
  */
 object OkHttpWorkerNetworkProbe {
     private const val TAG = "TgWsProxy"
@@ -35,7 +36,9 @@ object OkHttpWorkerNetworkProbe {
     private const val OP_TIMEOUT_MILLIS = 12_000L
     private const val TARGET_UPLOAD_BYTES = 1024 * 1024
     private const val UPLOAD_CHUNK_BYTES = 4 * 1024
+    private const val DEFAULT_MIN_COMPRESS_BYTES = 1024L
 
+    private val secureRandom = SecureRandom()
     private val sizes = intArrayOf(
         1 * 1024,
         4 * 1024,
@@ -50,6 +53,15 @@ object OkHttpWorkerNetworkProbe {
         512 * 1024,
         1024 * 1024,
     )
+
+    private data class Config(
+        val transport: String,
+        val minCompressBytes: Long,
+        val randomPayload: Boolean,
+    ) {
+        val payloadMode: String get() = if (randomPayload) "random" else "pattern"
+        val compressionMode: String get() = if (minCompressBytes == Long.MAX_VALUE) "disabled" else "default"
+    }
 
     private data class ProbeCase(
         val mode: String,
@@ -100,7 +112,10 @@ object OkHttpWorkerNetworkProbe {
         fun summary(): String = lastAddresses.joinToString(",") { it.hostAddress ?: "?" }
     }
 
-    private class Listener(private val dns: FamilyDns) : WebSocketListener() {
+    private class Listener(
+        private val dns: FamilyDns,
+        private val config: Config,
+    ) : WebSocketListener() {
         val openLatch = CountDownLatch(1)
         val incoming = LinkedBlockingQueue<Incoming>()
 
@@ -113,12 +128,17 @@ object OkHttpWorkerNetworkProbe {
         override fun onOpen(webSocket: WebSocket, response: Response) {
             val handshake = response.handshake
             val revision = response.header("X-Tgws-Worker-Revision") ?: "unknown"
+            val extensions = response.header("Sec-WebSocket-Extensions") ?: "none"
             handshakeState = buildString {
                 append("stack=okhttp")
                 append(" protocol=").append(response.protocol)
                 append(" tls=").append(handshake?.tlsVersion?.javaName ?: "unknown")
                 append(" cipher=").append(handshake?.cipherSuite?.javaName ?: "unknown")
                 append(" worker_revision=").append(revision)
+                append(" ws_extensions=").append(extensions.replace(' ', '_'))
+                append(" compression=").append(config.compressionMode)
+                append(" min_compress_bytes=").append(config.minCompressBytes)
+                append(" payload_mode=").append(config.payloadMode)
                 append(" dns=").append(dns.summary())
             }
             openLatch.countDown()
@@ -174,13 +194,46 @@ object OkHttpWorkerNetworkProbe {
         else -> "auto"
     }
 
+    private fun configFor(transportRaw: String): Config {
+        return when (transportRaw.trim().lowercase()) {
+            "okhttpnocompression", "okhttp_no_compression" -> Config(
+                transport = "okhttp_no_compression",
+                minCompressBytes = Long.MAX_VALUE,
+                randomPayload = false,
+            )
+            "okhttprandom", "okhttp_random" -> Config(
+                transport = "okhttp_random",
+                minCompressBytes = DEFAULT_MIN_COMPRESS_BYTES,
+                randomPayload = true,
+            )
+            "okhttpnocompressionrandom", "okhttp_no_compression_random" -> Config(
+                transport = "okhttp_no_compression_random",
+                minCompressBytes = Long.MAX_VALUE,
+                randomPayload = true,
+            )
+            else -> Config(
+                transport = "okhttp",
+                minCompressBytes = DEFAULT_MIN_COMPRESS_BYTES,
+                randomPayload = false,
+            )
+        }
+    }
+
+    private fun payload(size: Int, seedOffset: Int, config: Config): ByteArray {
+        if (config.randomPayload) {
+            return ByteArray(size).also(secureRandom::nextBytes)
+        }
+        return ByteArray(size) { i -> ((i + seedOffset) and 0xff).toByte() }
+    }
+
     private fun open(
         client: OkHttpClient,
         dns: FamilyDns,
         domain: String,
         path: String,
+        config: Config,
     ): Session {
-        val listener = Listener(dns)
+        val listener = Listener(dns, config)
         val request = Request.Builder()
             .url("wss://$domain$path")
             .header("Sec-WebSocket-Protocol", "binary")
@@ -197,10 +250,10 @@ object OkHttpWorkerNetworkProbe {
         return Session(webSocket, listener)
     }
 
-    private fun logCase(case: ProbeCase) {
+    private fun logCase(case: ProbeCase, config: Config) {
         Log.i(
             TAG,
-            "Worker network probe transport=okhttp mode=${case.mode} " +
+            "Worker network probe transport=${config.transport} mode=${case.mode} " +
                 "size_bytes=${case.sizeBytes} cumulative_bytes=${case.cumulativeBytes} " +
                 "ok=${case.ok} duration_ms=${case.durationMs} " +
                 "error=${case.error.ifBlank { "none" }} ${case.transportState}",
@@ -211,35 +264,36 @@ object OkHttpWorkerNetworkProbe {
         client: OkHttpClient,
         dns: FamilyDns,
         domain: String,
+        config: Config,
     ): List<ProbeCase> {
         val cases = mutableListOf<ProbeCase>()
         val session = try {
-            open(client, dns, domain, "/diag/ws-echo?sid=probe-okhttp-echo")
+            open(client, dns, domain, "/diag/ws-echo?sid=probe-${config.transport}-echo", config)
         } catch (t: Throwable) {
             return listOf(
                 ProbeCase(
                     mode = "echo_staircase_connect",
                     error = "${t.javaClass.simpleName}:${t.message}",
-                ).also(::logCase),
+                ).also { logCase(it, config) },
             )
         }
 
         var cumulative = 0
         try {
             for ((index, size) in sizes.withIndex()) {
-                val payload = ByteArray(size) { i -> ((i + index) and 0xff).toByte() }
+                val bytes = payload(size, index, config)
                 val started = System.nanoTime()
                 var error = ""
                 var ok = false
                 try {
-                    if (!session.webSocket.send(payload.toByteString())) {
+                    if (!session.webSocket.send(bytes.toByteString())) {
                         throw IOException("okhttp_send_rejected")
                     }
                     val received = session.receive()
                     if (received !is Incoming.Binary) {
                         throw IOException("unexpected_echo_type:${received.javaClass.simpleName}")
                     }
-                    if (received.value.size != payload.size || !received.value.toByteArray().contentEquals(payload)) {
+                    if (received.value.size != bytes.size || !received.value.toByteArray().contentEquals(bytes)) {
                         throw IOException("echo_payload_mismatch:${received.value.size}")
                     }
                     cumulative += size
@@ -256,7 +310,7 @@ object OkHttpWorkerNetworkProbe {
                     transportState = session.state(),
                     error = error,
                 )
-                logCase(case)
+                logCase(case, config)
                 cases += case
                 if (!ok) break
             }
@@ -270,16 +324,17 @@ object OkHttpWorkerNetworkProbe {
         client: OkHttpClient,
         dns: FamilyDns,
         domain: String,
+        config: Config,
     ): List<ProbeCase> {
         val cases = mutableListOf<ProbeCase>()
         val session = try {
-            open(client, dns, domain, "/diag/upload?sid=probe-okhttp-upload-4k")
+            open(client, dns, domain, "/diag/upload?sid=probe-${config.transport}-upload-4k", config)
         } catch (t: Throwable) {
             return listOf(
                 ProbeCase(
                     mode = "upload_4k_connect",
                     error = "${t.javaClass.simpleName}:${t.message}",
-                ).also(::logCase),
+                ).also { logCase(it, config) },
             )
         }
 
@@ -287,12 +342,12 @@ object OkHttpWorkerNetworkProbe {
         try {
             while (cumulative < TARGET_UPLOAD_BYTES) {
                 val chunkIndex = cumulative / UPLOAD_CHUNK_BYTES
-                val payload = ByteArray(UPLOAD_CHUNK_BYTES) { i -> ((i + chunkIndex) and 0xff).toByte() }
+                val bytes = payload(UPLOAD_CHUNK_BYTES, chunkIndex, config)
                 val started = System.nanoTime()
                 var error = ""
                 var ok = false
                 try {
-                    if (!session.webSocket.send(payload.toByteString())) {
+                    if (!session.webSocket.send(bytes.toByteString())) {
                         throw IOException("okhttp_send_rejected")
                     }
                     val incoming = session.receive()
@@ -321,7 +376,7 @@ object OkHttpWorkerNetworkProbe {
                         transportState = session.state(),
                         error = error,
                     )
-                    logCase(case)
+                    logCase(case, config)
                     cases += case
                 }
                 if (!ok) break
@@ -336,6 +391,7 @@ object OkHttpWorkerNetworkProbe {
         client: OkHttpClient,
         dns: FamilyDns,
         domain: String,
+        config: Config,
     ): List<ProbeCase> {
         val cases = mutableListOf<ProbeCase>()
         for (size in sizes) {
@@ -344,7 +400,13 @@ object OkHttpWorkerNetworkProbe {
             var error = ""
             var ok = false
             try {
-                session = open(client, dns, domain, "/diag/download?size=$size&sid=probe-okhttp-download-$size")
+                session = open(
+                    client,
+                    dns,
+                    domain,
+                    "/diag/download?size=$size&sid=probe-${config.transport}-download-$size",
+                    config,
+                )
                 val incoming = session.receive()
                 if (incoming !is Incoming.Binary) {
                     throw IOException("unexpected_download_type:${incoming.javaClass.simpleName}")
@@ -364,7 +426,7 @@ object OkHttpWorkerNetworkProbe {
                 transportState = session?.state().orEmpty(),
                 error = error,
             )
-            logCase(case)
+            logCase(case, config)
             cases += case
             session?.close()
             if (!ok) break
@@ -372,15 +434,19 @@ object OkHttpWorkerNetworkProbe {
         return cases
     }
 
-    fun run(domainRaw: String, familyRaw: String): String {
+    fun run(domainRaw: String, familyRaw: String, transportRaw: String = "okhttp"): String {
         val domain = domainRaw.trim().removePrefix("https://").removePrefix("http://").trimEnd('/')
         val family = normalizeFamily(familyRaw)
+        val config = configFor(transportRaw)
         val report = JSONObject()
         val casesJson = JSONArray()
-        report.put("revision", "worker-network-probe-okhttp-v1")
+        report.put("revision", "worker-network-probe-okhttp-v2")
         report.put("domain", domain)
         report.put("ip_family", family)
-        report.put("transport", "okhttp")
+        report.put("transport", config.transport)
+        report.put("compression", config.compressionMode)
+        report.put("min_compress_bytes", config.minCompressBytes)
+        report.put("payload_mode", config.payloadMode)
         report.put("started_ms", System.currentTimeMillis())
         report.put("cases", casesJson)
 
@@ -394,20 +460,26 @@ object OkHttpWorkerNetworkProbe {
             .dns(dns)
             .connectTimeout(CONNECT_TIMEOUT_SECONDS, TimeUnit.SECONDS)
             .retryOnConnectionFailure(false)
+            .minWebSocketMessageToCompress(config.minCompressBytes)
             .build()
 
-        Log.i(TAG, "Worker network probe start domain=$domain ip_family=$family transport=okhttp revision=worker-network-probe-okhttp-v1")
+        Log.i(
+            TAG,
+            "Worker network probe start domain=$domain ip_family=$family transport=${config.transport} " +
+                "revision=worker-network-probe-okhttp-v2 compression=${config.compressionMode} " +
+                "min_compress_bytes=${config.minCompressBytes} payload_mode=${config.payloadMode}",
+        )
         val cases = mutableListOf<ProbeCase>()
         try {
-            cases += echoCases(client, dns, domain)
-            cases += uploadCases(client, dns, domain)
-            cases += downloadCases(client, dns, domain)
+            cases += echoCases(client, dns, domain, config)
+            cases += uploadCases(client, dns, domain, config)
+            cases += downloadCases(client, dns, domain, config)
         } finally {
             client.connectionPool.evictAll()
             client.dispatcher.executorService.shutdown()
         }
         cases.forEach { casesJson.put(it.toJson()) }
-        Log.i(TAG, "Worker network probe complete domain=$domain ip_family=$family transport=okhttp cases=${cases.size}")
+        Log.i(TAG, "Worker network probe complete domain=$domain ip_family=$family transport=${config.transport} cases=${cases.size}")
         return report.toString()
     }
 }
