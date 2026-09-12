@@ -8,7 +8,7 @@ interface ProxyLibrary : Library {
     companion object {
         val INSTANCE = Native.load("tgwsproxy", ProxyLibrary::class.java) as ProxyLibrary
     }
-    
+
     fun StartProxy(host: String, port: Int, dcIps: String, verbose: Int): Int
     fun StopProxy(): Int
     fun SetPoolSize(size: Int)
@@ -21,6 +21,7 @@ interface ProxyLibrary : Library {
     fun StartMtProtoProxy(host: String, port: Int, secret: String, runtimeConfig: String, verbose: Int): Int
     fun StopMtProtoProxy(): Int
     fun GetMtProtoProxyStatus(): Pointer?
+    fun RunWorkerNetworkProbe(domain: String): Pointer?
     fun ResetAdaptiveRouteStats(all: Int)
     fun ResetAdaptiveNetworkRouteStats(profileId: String)
     fun FreeString(p: Pointer)
@@ -73,6 +74,12 @@ object NativeProxy {
     }
     fun getMtProtoProxyStatus(): String? {
         val ptr = ProxyLibrary.INSTANCE.GetMtProtoProxyStatus() ?: return null
+        val res = ptr.getString(0)
+        ProxyLibrary.INSTANCE.FreeString(ptr)
+        return res
+    }
+    fun runWorkerNetworkProbe(domain: String): String? {
+        val ptr = ProxyLibrary.INSTANCE.RunWorkerNetworkProbe(domain) ?: return null
         val res = ptr.getString(0)
         ProxyLibrary.INSTANCE.FreeString(ptr)
         return res
