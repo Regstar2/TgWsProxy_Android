@@ -4,7 +4,7 @@ param(
     [string]$WorkerDomain,
     [ValidateSet("Auto", "IPv4", "IPv6")]
     [string]$IPFamily = "Auto",
-    [ValidateSet("Go", "OkHttp", "UTLS", "GoDynamic", "GoSplit1200", "GoSplit4K", "GoSplit16K", "GoPaced4K")]
+    [ValidateSet("Go", "OkHttp", "SSLSocket", "UTLS", "GoDynamic", "GoSplit1200", "GoSplit4K", "GoSplit16K", "GoPaced4K")]
     [string]$Transport = "Go",
     [switch]$SkipBuild,
     [string]$DeviceSerial = "",
