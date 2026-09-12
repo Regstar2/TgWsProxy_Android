@@ -42,6 +42,12 @@ func TestNormalizeWorkerProbeTransport(t *testing.T) {
 		{"utls", workerProbeTransportUTLS, true},
 		{"chrome", workerProbeTransportUTLS, true},
 		{"chrome_auto", workerProbeTransportUTLS, true},
+		{"go_dynamic", workerProbeTransportGoDynamic, true},
+		{"GoDynamic", workerProbeTransportGoDynamic, true},
+		{"split1200", workerProbeTransportGoSplit1200, true},
+		{"GoSplit4K", workerProbeTransportGoSplit4K, true},
+		{"split16k", workerProbeTransportGoSplit16K, true},
+		{"GoPaced4K", workerProbeTransportGoPaced4K, true},
 		{"okhttp", "", false},
 		{"bogus", "", false},
 	}
