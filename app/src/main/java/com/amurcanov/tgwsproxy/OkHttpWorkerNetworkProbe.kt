@@ -226,7 +226,7 @@ object OkHttpWorkerNetworkProbe {
 
         var cumulative = 0
         try {
-            sizes.forEachIndexed { index, size ->
+            for ((index, size) in sizes.withIndex()) {
                 val payload = ByteArray(size) { i -> ((i + index) and 0xff).toByte() }
                 val started = System.nanoTime()
                 var error = ""
@@ -258,7 +258,7 @@ object OkHttpWorkerNetworkProbe {
                 )
                 logCase(case)
                 cases += case
-                if (!ok) return@forEachIndexed
+                if (!ok) break
             }
         } finally {
             session.close()
