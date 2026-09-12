@@ -9,6 +9,7 @@ class WorkerNetworkProbeActivity : Activity() {
         super.onCreate(savedInstanceState)
         val domain = intent?.getStringExtra(EXTRA_DOMAIN).orEmpty().trim()
         val family = intent?.getStringExtra(EXTRA_FAMILY).orEmpty().trim().ifEmpty { "auto" }
+        val transport = intent?.getStringExtra(EXTRA_TRANSPORT).orEmpty().trim().lowercase().ifEmpty { "go" }
         if (domain.isEmpty()) {
             Log.e(TAG, "PROBE_DONE error=missing_domain")
             finish()
@@ -17,8 +18,12 @@ class WorkerNetworkProbeActivity : Activity() {
 
         Thread {
             try {
-                Log.i(TAG, "PROBE_START domain=$domain ip_family=$family")
-                val report = NativeProxy.runWorkerNetworkProbe(domain, family).orEmpty()
+                Log.i(TAG, "PROBE_START domain=$domain ip_family=$family transport=$transport")
+                val report = when (transport) {
+                    "okhttp" -> OkHttpWorkerNetworkProbe.run(domain, family)
+                    "go" -> NativeProxy.runWorkerNetworkProbe(domain, family).orEmpty()
+                    else -> throw IllegalArgumentException("unsupported_transport:$transport")
+                }
                 if (report.isEmpty()) {
                     Log.e(TAG, "PROBE_RESULT empty")
                 } else {
@@ -26,9 +31,9 @@ class WorkerNetworkProbeActivity : Activity() {
                         Log.i(TAG, "PROBE_RESULT part=${index + 1} $chunk")
                     }
                 }
-                Log.i(TAG, "PROBE_DONE domain=$domain ip_family=$family")
+                Log.i(TAG, "PROBE_DONE domain=$domain ip_family=$family transport=$transport")
             } catch (t: Throwable) {
-                Log.e(TAG, "PROBE_DONE error=${t.javaClass.simpleName}:${t.message}", t)
+                Log.e(TAG, "PROBE_DONE error=${t.javaClass.simpleName}:${t.message} transport=$transport", t)
             } finally {
                 runOnUiThread { finish() }
             }
@@ -38,6 +43,7 @@ class WorkerNetworkProbeActivity : Activity() {
     companion object {
         const val EXTRA_DOMAIN = "domain"
         const val EXTRA_FAMILY = "family"
+        const val EXTRA_TRANSPORT = "transport"
         private const val TAG = "TgWsProxyProbe"
         private const val LOG_CHUNK_SIZE = 3000
     }
