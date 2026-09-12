@@ -21,8 +21,7 @@ class WorkerNetworkProbeActivity : Activity() {
                 Log.i(TAG, "PROBE_START domain=$domain ip_family=$family transport=$transport")
                 val report = when (transport) {
                     "okhttp" -> OkHttpWorkerNetworkProbe.run(domain, family)
-                    "go", "utls" -> NativeProxy.runWorkerNetworkProbe(domain, family, transport).orEmpty()
-                    else -> throw IllegalArgumentException("unsupported_transport:$transport")
+                    else -> NativeProxy.runWorkerNetworkProbe(domain, family, transport).orEmpty()
                 }
                 if (report.isEmpty()) {
                     Log.e(TAG, "PROBE_RESULT empty")
