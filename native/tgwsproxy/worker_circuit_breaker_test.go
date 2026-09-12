@@ -60,6 +60,57 @@ func TestWorkerCandidatesForSessionSkipsCircuitOpenPrimary(t *testing.T) {
 	}
 }
 
+func TestWorkerCandidatesForSessionKeepsLocalProbeWhenAllCircuitsOpen(t *testing.T) {
+	resetWorkerCircuitForTests()
+	t.Cleanup(resetWorkerCircuitForTests)
+
+	now := time.Now()
+	settings := workerFailoverSettings{
+		Enabled:           true,
+		SelectionStrategy: workerSelectionStrategyRoundRobin,
+		Candidates: []workerFailoverCandidate{
+			{ID: "first", Domain: "first.workers.dev"},
+			{ID: "second", Domain: "second.workers.dev"},
+		},
+	}
+	markWorkerQuotaExhausted("first.workers.dev", now.Add(time.Hour))
+	markWorkerCircuit("second.workers.dev", workerCircuitReasonTemporaryFailed, now.Add(5*time.Minute))
+
+	got, _ := workerCandidatesForSession(settings, "", "session-b")
+	if len(got) != 1 {
+		t.Fatalf("candidates=%+v want one local diagnostic probe", got)
+	}
+	if _, blocked := activeWorkerCircuit(got[0].Domain, time.Now()); !blocked {
+		t.Fatalf("diagnostic probe domain=%s must remain circuit-open", got[0].Domain)
+	}
+}
+
+func TestWorkerCircuitSummaryCountsReasonsAndNextRetry(t *testing.T) {
+	resetWorkerCircuitForTests()
+	t.Cleanup(resetWorkerCircuitForTests)
+
+	now := time.Date(2026, 9, 12, 18, 0, 0, 0, time.UTC)
+	quotaReset := now.Add(6 * time.Hour)
+	temporaryReset := now.Add(45 * time.Second)
+	markWorkerQuotaExhausted("quota.workers.dev", quotaReset)
+	markWorkerCircuit("temporary.workers.dev", workerCircuitReasonTemporaryFailed, temporaryReset)
+
+	summary := summarizeWorkerCandidateCircuits([]workerFailoverCandidate{
+		{ID: "quota", Domain: "quota.workers.dev"},
+		{ID: "temporary", Domain: "temporary.workers.dev"},
+		{ID: "healthy", Domain: "healthy.workers.dev"},
+	}, now)
+	if summary.Configured != 3 || summary.Available != 1 || summary.QuotaExhausted != 1 || summary.TemporaryFailed != 1 || summary.OtherBlocked != 0 {
+		t.Fatalf("summary=%+v", summary)
+	}
+	if !summary.NextRetry.Equal(temporaryReset) {
+		t.Fatalf("next retry=%s want=%s", summary.NextRetry, temporaryReset)
+	}
+	if got := summary.nextRetryField(); got != temporaryReset.UTC().Format(time.RFC3339) {
+		t.Fatalf("next retry field=%s", got)
+	}
+}
+
 func TestChunkRelayCircuitErrorMarksQuotaUntilReset(t *testing.T) {
 	resetWorkerCircuitForTests()
 	t.Cleanup(resetWorkerCircuitForTests)
