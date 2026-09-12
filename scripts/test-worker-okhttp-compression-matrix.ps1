@@ -25,19 +25,19 @@ $first = $true
 foreach ($transport in $transports) {
     Write-Host ""
     Write-Host "=== $transport / $IPFamily ==="
-    $args = @(
+    $runnerArgs = @(
         "-WorkerDomain", $WorkerDomain,
         "-Transport", $transport,
         "-IPFamily", $IPFamily,
         "-TimeoutSeconds", $TimeoutSeconds
     )
     if ($DeviceSerial) {
-        $args += @("-DeviceSerial", $DeviceSerial)
+        $runnerArgs += @("-DeviceSerial", $DeviceSerial)
     }
     if (-not $first) {
-        $args += "-SkipBuild"
+        $runnerArgs += "-SkipBuild"
     }
-    & $runner @args
+    & $runner @runnerArgs
     if ($LASTEXITCODE -ne 0) {
         throw "Probe failed for transport $transport"
     }
