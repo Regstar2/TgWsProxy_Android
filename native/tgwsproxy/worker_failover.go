@@ -206,6 +206,9 @@ func classifyWorkerConnectFailure(err error) string {
 	if err == nil {
 		return "worker_runtime_failure"
 	}
+	if _, ok := workerCircuitError(err); ok {
+		return "all_workers_circuit_open"
+	}
 	msg := strings.ToLower(err.Error())
 	switch {
 	case strings.Contains(msg, "timeout"), strings.Contains(msg, "deadline"):
