@@ -123,3 +123,50 @@ test("backpressure waits when the next downstream chunk would exceed the queue l
   await wait;
   assert.equal(resolved, true);
 });
+
+test("top-level worker maps Durable Object free-tier duration exhaustion to a recoverable response", async () => {
+  const env = {
+    CHUNK_RELAY: {
+      getByName() {
+        return {
+          async fetch() {
+            throw new Error("Exceeded allowed duration in Durable Objects free tier.");
+          },
+        };
+      },
+    },
+  };
+
+  const response = await mod.default.fetch(new Request(
+    "https://example.workers.dev/chunk-relay/open?sid=session_quota_123&dst=149.154.167.51",
+    { method: "POST" },
+  ), env, {});
+
+  assert.equal(response.status, 503);
+  assert.equal(response.headers.get("X-Tgws-Worker-State"), "do-quota-exhausted");
+  assert.equal(response.headers.get("X-Tgws-Chunk-Relay-Revision"), "chunk-relay-mtproto-v7");
+  assert.ok(Number.parseInt(response.headers.get("Retry-After") || "0", 10) >= 60);
+  assert.ok(!Number.isNaN(Date.parse(response.headers.get("X-Tgws-Quota-Reset") || "")));
+});
+
+test("top-level worker does not hide unrelated Durable Object exceptions", async () => {
+  const env = {
+    CHUNK_RELAY: {
+      getByName() {
+        return {
+          async fetch() {
+            throw new Error("unexpected durable object failure");
+          },
+        };
+      },
+    },
+  };
+
+  await assert.rejects(
+    () => mod.default.fetch(new Request(
+      "https://example.workers.dev/chunk-relay/open?sid=session_error_123&dst=149.154.167.51",
+      { method: "POST" },
+    ), env, {}),
+    /unexpected durable object failure/,
+  );
+});
