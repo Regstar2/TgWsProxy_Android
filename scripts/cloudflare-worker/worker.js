@@ -1,7 +1,9 @@
 import { connect } from "cloudflare:sockets";
 
 const REVISION = "worker-stream-v2";
+const DIAG_REVISION = "worker-network-probe-v1";
 const MAX_PENDING_BYTES = 32 * 1024 * 1024;
+const MAX_DIAG_BYTES = 2 * 1024 * 1024;
 
 async function toBytes(data) {
   if (data instanceof ArrayBuffer) return new Uint8Array(data);
@@ -21,6 +23,93 @@ function dataSize(data) {
   return data?.byteLength ?? data?.size ?? data?.length ?? 0;
 }
 
+function websocketResponse(client, request, revision = REVISION) {
+  const headers = { "X-Tgws-Worker-Revision": revision };
+  const protocols = (request.headers.get("Sec-WebSocket-Protocol") || "")
+    .split(",").map((value) => value.trim());
+  if (protocols.includes("binary")) headers["Sec-WebSocket-Protocol"] = "binary";
+  return new Response(null, { status: 101, webSocket: client, headers });
+}
+
+function diagnosticWebSocket(request, url) {
+  const pair = new WebSocketPair();
+  const client = pair[0];
+  const server = pair[1];
+  server.accept();
+  const sid = url.searchParams.get("sid") || "?";
+  const started = Date.now();
+  const log = (event, fields = {}) => console.log(event, {
+    sid,
+    path: url.pathname,
+    revision: DIAG_REVISION,
+    elapsed_ms: Date.now() - started,
+    ...fields,
+  });
+
+  if (url.pathname === "/diag/ws-echo") {
+    let receivedBytes = 0;
+    let messages = 0;
+    server.addEventListener("message", async (event) => {
+      try {
+        const size = dataSize(event.data);
+        if (size > MAX_DIAG_BYTES) {
+          server.close(1009, "diag_message_too_large");
+          return;
+        }
+        const bytes = await toBytes(event.data);
+        receivedBytes += bytes.byteLength;
+        messages++;
+        server.send(bytes);
+        if (messages <= 2 || receivedBytes % (64 * 1024) < bytes.byteLength) {
+          log("diag echo", { messages, bytes: bytes.byteLength, received_bytes: receivedBytes });
+        }
+      } catch {
+        server.close(1011, "diag_echo_failed");
+      }
+    });
+    server.addEventListener("close", () => log("diag echo close", { messages, received_bytes: receivedBytes }));
+    log("diag echo accepted");
+    return websocketResponse(client, request, DIAG_REVISION);
+  }
+
+  if (url.pathname === "/diag/upload") {
+    let receivedBytes = 0;
+    let messages = 0;
+    server.addEventListener("message", (event) => {
+      const size = dataSize(event.data);
+      if (size > MAX_DIAG_BYTES || receivedBytes + size > 64 * MAX_DIAG_BYTES) {
+        server.close(1009, "diag_upload_too_large");
+        return;
+      }
+      receivedBytes += size;
+      messages++;
+      server.send(`ack:${receivedBytes}`);
+      if (messages <= 2 || receivedBytes % (64 * 1024) < size) {
+        log("diag upload", { messages, bytes: size, received_bytes: receivedBytes });
+      }
+    });
+    server.addEventListener("close", () => log("diag upload close", { messages, received_bytes: receivedBytes }));
+    log("diag upload accepted");
+    return websocketResponse(client, request, DIAG_REVISION);
+  }
+
+  if (url.pathname === "/diag/download") {
+    const size = Number.parseInt(url.searchParams.get("size") || "0", 10);
+    if (!Number.isFinite(size) || size < 0 || size > MAX_DIAG_BYTES) {
+      try { server.close(1008, "invalid_diag_size"); } catch {}
+      return new Response("Invalid size", { status: 400 });
+    }
+    const payload = new Uint8Array(size);
+    for (let i = 0; i < payload.length; i += 4096) payload[i] = (i / 4096) & 0xff;
+    server.send(payload);
+    log("diag download sent", { bytes: size });
+    server.addEventListener("close", () => log("diag download close", { bytes: size }));
+    return websocketResponse(client, request, DIAG_REVISION);
+  }
+
+  return null;
+}
+
 // The injected connector lets tests exercise this handler without contacting
 // Telegram. Production always uses cloudflare:sockets below.
 export function createWorkerHandler(connectTCP) {
@@ -30,6 +119,11 @@ export function createWorkerHandler(connectTCP) {
         return new Response("WebSocket upgrade required", { status: 426 });
       }
       const url = new URL(request.url);
+      if (url.pathname.startsWith("/diag/")) {
+        const response = diagnosticWebSocket(request, url);
+        if (response) return response;
+        return new Response("Not found", { status: 404 });
+      }
       if (url.pathname !== "/apiws") {
         return new Response("Not found", { status: 404 });
       }
@@ -76,8 +170,6 @@ export function createWorkerHandler(connectTCP) {
           downstream_bytes: downstreamBytes,
           pending_bytes: pendingBytes,
         });
-        // writer.close() queues behind a pending write and cannot cancel it.
-        // Close the socket directly so both directions stop even under pressure.
         try { Promise.resolve(socket?.close()).catch(() => {}); } catch {}
         try { server.close(code, reason); } catch {}
       }
@@ -129,13 +221,11 @@ export function createWorkerHandler(connectTCP) {
           return;
         }
         pendingBytes += size;
-        // Enqueue before asynchronous conversion: a later ArrayBuffer must not
-        // overtake an earlier Blob. Exactly one TCP write runs at a time.
         chain = chain.then(async () => {
           if (closed) return;
           const chunk = await toBytes(event.data);
           if (closed || !chunk.byteLength) return;
-          startTCP(); // The first nonempty message, including relay_init.
+          startTCP();
           const writeStarted = Date.now();
           trace("tcp write start", { seq, bytes: chunk.byteLength, pending_bytes: pendingBytes });
           await writer.write(chunk);
@@ -153,11 +243,7 @@ export function createWorkerHandler(connectTCP) {
       server.addEventListener("error", () => closeRelay("ws_error", 1011));
 
       log("apiws accepted", { tcp_connect: "lazy", diagnostics: diagnostic });
-      const headers = { "X-Tgws-Worker-Revision": REVISION };
-      const protocols = (request.headers.get("Sec-WebSocket-Protocol") || "")
-        .split(",").map((value) => value.trim());
-      if (protocols.includes("binary")) headers["Sec-WebSocket-Protocol"] = "binary";
-      return new Response(null, { status: 101, webSocket: client, headers });
+      return websocketResponse(client, request, REVISION);
     },
   };
 }
