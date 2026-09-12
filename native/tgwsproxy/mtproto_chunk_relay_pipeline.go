@@ -14,9 +14,10 @@ import (
 )
 
 const (
-	mtProtoChunkRelayUpWindow            = 4
-	mtProtoChunkRelayPrimaryRequests     = 16
-	mtProtoChunkRelayGlobalHTTPRequests  = 24
+	mtProtoChunkRelayUpWindow           = 4
+	mtProtoChunkRelayPrimaryRequests    = 16
+	mtProtoChunkRelayGlobalHTTPRequests = 24
+	mtProtoChunkRelayPipelineMode       = "sliding"
 )
 
 var (
@@ -282,81 +283,105 @@ func writePipelinedMtProtoChunkRelay(c *mtProtoChunkRelayConn, data []byte) (int
 		})
 	}
 
+	pipelineCtx, pipelineCancel := context.WithCancel(context.Background())
+	defer pipelineCancel()
+
+	results := make(chan mtProtoChunkUploadResult, len(specs))
+	head := newMtProtoChunkRelayHeadTracker(specs[0].seq)
+
+	launch := func(spec mtProtoChunkUploadSpec) {
+		go func() {
+			if err := acquireMtProtoChunkRelayPrimarySlot(c); err != nil {
+				results <- mtProtoChunkUploadResult{spec: spec, err: err}
+				return
+			}
+			defer releaseMtProtoChunkRelayPrimarySlot()
+
+			query := url.Values{
+				"sid": {c.sessionID},
+				"dst": {c.workerDst},
+				"seq": {strconv.FormatInt(spec.seq, 10)},
+			}
+			status, headers, _, err := c.requestPipelinedUploadWithRetry(
+				pipelineCtx,
+				query,
+				data[spec.start:spec.end],
+				spec.seq,
+				head,
+			)
+			if err == nil && status == http.StatusNoContent {
+				ack, ackErr := strconv.ParseInt(strings.TrimSpace(headers.Get("X-Tgws-Chunk-Ack")), 10, 64)
+				if ackErr == nil && ack == spec.seq {
+					head.markDone(spec.seq)
+				}
+			}
+			results <- mtProtoChunkUploadResult{spec: spec, status: status, headers: headers, err: err}
+		}()
+	}
+
+	nextLaunch := 0
+	for nextLaunch < len(specs) && nextLaunch < mtProtoChunkRelayUpWindow {
+		launch(specs[nextLaunch])
+		nextLaunch++
+	}
+
+	completed := make(map[int64]mtProtoChunkUploadResult, mtProtoChunkRelayUpWindow)
+	nextCommit := 0
 	written := 0
-	for batchStart := 0; batchStart < len(specs); batchStart += mtProtoChunkRelayUpWindow {
-		batchEnd := batchStart + mtProtoChunkRelayUpWindow
-		if batchEnd > len(specs) {
-			batchEnd = len(specs)
+
+	for nextCommit < len(specs) {
+		result := <-results
+
+		if result.err != nil {
+			pipelineCancel()
+			return written, result.err
 		}
-		batch := specs[batchStart:batchEnd]
-		results := make(chan mtProtoChunkUploadResult, len(batch))
-		head := newMtProtoChunkRelayHeadTracker(batch[0].seq)
-
-		for _, spec := range batch {
-			spec := spec
-			go func() {
-				if err := acquireMtProtoChunkRelayPrimarySlot(c); err != nil {
-					results <- mtProtoChunkUploadResult{spec: spec, err: err}
-					return
-				}
-				defer releaseMtProtoChunkRelayPrimarySlot()
-
-				query := url.Values{
-					"sid": {c.sessionID},
-					"dst": {c.workerDst},
-					"seq": {strconv.FormatInt(spec.seq, 10)},
-				}
-				status, headers, _, err := c.requestPipelinedUploadWithRetry(
-					context.Background(),
-					query,
-					data[spec.start:spec.end],
-					spec.seq,
-					head,
-				)
-				if err == nil && status == http.StatusNoContent {
-					ack, ackErr := strconv.ParseInt(strings.TrimSpace(headers.Get("X-Tgws-Chunk-Ack")), 10, 64)
-					if ackErr == nil && ack == spec.seq {
-						head.markDone(spec.seq)
-					}
-				}
-				results <- mtProtoChunkUploadResult{spec: spec, status: status, headers: headers, err: err}
-			}()
+		if result.status == http.StatusGone {
+			pipelineCancel()
+			return written, io.EOF
+		}
+		if result.status != http.StatusNoContent {
+			pipelineCancel()
+			return written, fmt.Errorf("chunk relay up seq %d: HTTP %d", result.spec.seq, result.status)
+		}
+		ack, err := strconv.ParseInt(strings.TrimSpace(result.headers.Get("X-Tgws-Chunk-Ack")), 10, 64)
+		if err != nil || ack != result.spec.seq {
+			pipelineCancel()
+			return written, fmt.Errorf("chunk relay up seq %d: invalid ack %q", result.spec.seq, result.headers.Get("X-Tgws-Chunk-Ack"))
 		}
 
-		bySeq := make(map[int64]mtProtoChunkUploadResult, len(batch))
-		for range batch {
-			result := <-results
-			bySeq[result.spec.seq] = result
+		completed[result.spec.seq] = result
+
+		// True sliding window: as soon as any in-flight chunk receives a valid
+		// ACK, immediately launch the next chunk instead of waiting for the
+		// remaining members of a fixed batch.
+		if nextLaunch < len(specs) {
+			launch(specs[nextLaunch])
+			nextLaunch++
 		}
 
-		for _, spec := range batch {
-			result := bySeq[spec.seq]
-			if result.err != nil {
-				return written, result.err
+		for nextCommit < len(specs) {
+			spec := specs[nextCommit]
+			if _, ok := completed[spec.seq]; !ok {
+				break
 			}
-			if result.status == http.StatusGone {
-				return written, io.EOF
-			}
-			if result.status != http.StatusNoContent {
-				return written, fmt.Errorf("chunk relay up seq %d: HTTP %d", spec.seq, result.status)
-			}
-			ack, err := strconv.ParseInt(strings.TrimSpace(result.headers.Get("X-Tgws-Chunk-Ack")), 10, 64)
-			if err != nil || ack != spec.seq {
-				return written, fmt.Errorf("chunk relay up seq %d: invalid ack %q", spec.seq, result.headers.Get("X-Tgws-Chunk-Ack"))
-			}
+			delete(completed, spec.seq)
 
 			chunkBytes := spec.end - spec.start
 			c.upSeq = spec.seq
 			c.upBytes += int64(chunkBytes)
 			written = spec.end
+			nextCommit++
+
 			if logInfo != nil && (spec.seq <= 2 || c.upBytes%(64*1024) < int64(chunkBytes)) {
 				logInfo.Printf(
-					"MTProto Worker chunk relay up session_id=%s seq=%d bytes=%d confirmed_bytes=%d upload_window=%d",
+					"MTProto Worker chunk relay up session_id=%s seq=%d bytes=%d confirmed_bytes=%d upload_window=%d pipeline=%s",
 					c.sessionID,
 					spec.seq,
 					chunkBytes,
 					c.upBytes,
 					mtProtoChunkRelayUpWindow,
+					mtProtoChunkRelayPipelineMode,
 				)
 			}
 		}

@@ -72,3 +72,86 @@ func TestChunkRelayPipelineStartsWindowBeforeWaitingForAck(t *testing.T) {
 		t.Fatalf("upBytes=%d want=%d", conn.upBytes, len(payload))
 	}
 }
+
+func TestChunkRelaySlidingWindowRefillsAfterSingleAck(t *testing.T) {
+	const totalChunks = mtProtoChunkRelayUpWindow + 1
+
+	started := make(chan int64, totalChunks)
+	releases := make(map[int64]chan struct{}, totalChunks)
+	for seq := int64(1); seq <= totalChunks; seq++ {
+		releases[seq] = make(chan struct{})
+	}
+
+	conn := newTestChunkRelayConn(t, func(_ context.Context, action string, query url.Values, _ []byte) (int, http.Header, []byte, error) {
+		if action != "up" {
+			t.Fatalf("action=%s", action)
+		}
+		seq, err := strconv.ParseInt(query.Get("seq"), 10, 64)
+		if err != nil {
+			t.Fatal(err)
+		}
+		started <- seq
+		<-releases[seq]
+		headers := make(http.Header)
+		headers.Set("X-Tgws-Chunk-Ack", strconv.FormatInt(seq, 10))
+		return http.StatusNoContent, headers, nil, nil
+	})
+
+	payload := make([]byte, mtProtoChunkRelayBytes*totalChunks)
+	done := make(chan error, 1)
+	go func() {
+		_, err := writePipelinedMtProtoChunkRelay(conn, payload)
+		done <- err
+	}()
+
+	seen := make(map[int64]bool, mtProtoChunkRelayUpWindow)
+	deadline := time.NewTimer(time.Second)
+	for len(seen) < mtProtoChunkRelayUpWindow {
+		select {
+		case seq := <-started:
+			seen[seq] = true
+		case <-deadline.C:
+			deadline.Stop()
+			t.Fatalf("only %d initial uploads started: %v", len(seen), seen)
+		}
+	}
+	deadline.Stop()
+
+	for seq := int64(1); seq <= mtProtoChunkRelayUpWindow; seq++ {
+		if !seen[seq] {
+			t.Fatalf("initial window missing seq=%d: %v", seq, seen)
+		}
+	}
+
+	// Release only seq=1. A fixed four-chunk batch would still wait for 2..4;
+	// a sliding window must immediately refill the freed slot with seq=5.
+	close(releases[1])
+	select {
+	case seq := <-started:
+		if seq != totalChunks {
+			t.Fatalf("next started seq=%d want=%d", seq, totalChunks)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("sliding window did not launch seq=5 after seq=1 ACK")
+	}
+
+	for seq := int64(2); seq <= totalChunks; seq++ {
+		close(releases[seq])
+	}
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("pipeline write: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("sliding pipeline write did not complete")
+	}
+
+	if conn.upSeq != totalChunks {
+		t.Fatalf("upSeq=%d want=%d", conn.upSeq, totalChunks)
+	}
+	if conn.upBytes != int64(len(payload)) {
+		t.Fatalf("upBytes=%d want=%d", conn.upBytes, len(payload))
+	}
+}
