@@ -237,7 +237,7 @@ export default {
 
     if (url.pathname.startsWith("/chunk-relay/")) {
       const sid = (url.searchParams.get("sid") || "").trim();
-      if (!/^[A-Za-z0-9_-]{8,128}$/.test(sid)) return new Response("invalid sid", { status: 400 });
+      if (!/^[A-Za-z0-9_-]{8,128}$/.test(sid)) return new Response("invalid sid", { status: 400, headers: headers() });
       return env.CHUNK_RELAY.getByName(sid).fetch(request);
     }
     return baseWorker.fetch(request, env, ctx);
