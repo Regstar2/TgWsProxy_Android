@@ -63,7 +63,7 @@ if (-not (Test-Path $releaseScript)) {
 }
 
 Write-Host "`n==> Audit release metadata, localization and tracked private files"
-& $releaseAudit -ExpectedVersion '1.10.14' -ExpectedVersionCode 52
+& $releaseAudit -ExpectedVersion '1.10.13' -ExpectedVersionCode 51
 if ($LASTEXITCODE -ne 0) {
     throw "Release audit failed with exit code $LASTEXITCODE."
 }
@@ -75,12 +75,12 @@ Invoke-CheckedCommand `
         '-NoProfile',
         '-ExecutionPolicy', 'Bypass',
         '-File', $releaseAudit,
-        '-ExpectedVersion', '1.10.14',
-        '-ExpectedVersionCode', '52'
+        '-ExpectedVersion', '1.10.13',
+        '-ExpectedVersionCode', '51'
     )
 
 Write-Host "`n==> Validate release-script metadata preflight"
-& $releaseScript -Version 'v1.10.14' -PreflightOnly
+& $releaseScript -Version 'v1.10.13' -PreflightOnly
 if ($LASTEXITCODE -ne 0) {
     throw "Release-script preflight failed with exit code $LASTEXITCODE."
 }
