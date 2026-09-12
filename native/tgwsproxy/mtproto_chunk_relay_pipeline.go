@@ -15,10 +15,10 @@ import (
 
 const (
 	mtProtoChunkRelayUploadBytes       = 12 * 1024
-	mtProtoChunkRelayUpWindow           = 4
-	mtProtoChunkRelayPrimaryRequests    = 16
-	mtProtoChunkRelayGlobalHTTPRequests = 24
-	mtProtoChunkRelayPipelineMode       = "sliding"
+	mtProtoChunkRelayUpWindow           = 3
+	mtProtoChunkRelayPrimaryRequests    = 12
+	mtProtoChunkRelayGlobalHTTPRequests = 18
+	mtProtoChunkRelayPipelineMode       = "sliding-w3"
 )
 
 var (
