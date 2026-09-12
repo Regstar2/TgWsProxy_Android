@@ -2,9 +2,10 @@ import baseWorker from "./worker.js";
 import { connect } from "cloudflare:sockets";
 import { DurableObject } from "cloudflare:workers";
 
-const REVISION = "chunk-relay-dc2-v1";
+const REVISION = "chunk-relay-dc2-v2";
 const TELEGRAM_DC2 = "149.154.167.51";
-const MAX_CHUNK_BYTES = 8 * 1024;
+const RELAY_MAX_CHUNK_BYTES = 8 * 1024;
+const DIAG_MAX_CHUNK_BYTES = 12 * 1024;
 const MAX_QUEUE_BYTES = 2 * 1024 * 1024;
 
 function headers(extra = {}) {
@@ -52,8 +53,8 @@ export class ChunkRelaySession extends DurableObject {
       const { value, done } = await this.reader.read();
       if (done) { this.closed = true; this.wake(); return; }
       const bytes = value instanceof Uint8Array ? value : new Uint8Array(value || 0);
-      for (let offset = 0; offset < bytes.byteLength; offset += MAX_CHUNK_BYTES) {
-        const chunk = bytes.slice(offset, Math.min(offset + MAX_CHUNK_BYTES, bytes.byteLength));
+      for (let offset = 0; offset < bytes.byteLength; offset += RELAY_MAX_CHUNK_BYTES) {
+        const chunk = bytes.slice(offset, Math.min(offset + RELAY_MAX_CHUNK_BYTES, bytes.byteLength));
         if (this.queueBytes + chunk.byteLength > MAX_QUEUE_BYTES) throw new Error("queue_limit");
         this.queue.push(chunk);
         this.queueBytes += chunk.byteLength;
@@ -85,7 +86,7 @@ export class ChunkRelaySession extends DurableObject {
       if (seq <= this.upSeq) return new Response(null, { status: 204, headers: headers({ "X-Tgws-Chunk-Ack": String(seq) }) });
       if (seq !== this.upSeq + 1) return new Response("sequence gap", { status: 409 });
       const body = new Uint8Array(await request.arrayBuffer());
-      if (!body.byteLength || body.byteLength > MAX_CHUNK_BYTES) return new Response("bad size", { status: 413 });
+      if (!body.byteLength || body.byteLength > RELAY_MAX_CHUNK_BYTES) return new Response("bad size", { status: 413 });
       await this.writer.write(body);
       this.upSeq = seq;
       return new Response(null, { status: 204, headers: headers({ "X-Tgws-Chunk-Ack": String(seq) }) });
@@ -121,13 +122,13 @@ export default {
     if (url.pathname === "/diag/fresh-upload") {
       if (request.method !== "POST") return new Response("method", { status: 405, headers: headers() });
       const body = new Uint8Array(await request.arrayBuffer());
-      if (!body.byteLength || body.byteLength > MAX_CHUNK_BYTES) return new Response("bad size", { status: 413, headers: headers() });
+      if (!body.byteLength || body.byteLength > DIAG_MAX_CHUNK_BYTES) return new Response("bad size", { status: 413, headers: headers() });
       return Response.json({ ok: true, bytes: body.byteLength, revision: REVISION }, { headers: headers() });
     }
 
     if (url.pathname === "/diag/fresh-download") {
       const size = Number.parseInt(url.searchParams.get("size") || "0", 10);
-      if (!Number.isSafeInteger(size) || size <= 0 || size > MAX_CHUNK_BYTES) return new Response("bad size", { status: 400, headers: headers() });
+      if (!Number.isSafeInteger(size) || size <= 0 || size > DIAG_MAX_CHUNK_BYTES) return new Response("bad size", { status: 400, headers: headers() });
       return new Response(randomBytes(size), { status: 200, headers: headers({ "Content-Type": "application/octet-stream" }) });
     }
 
