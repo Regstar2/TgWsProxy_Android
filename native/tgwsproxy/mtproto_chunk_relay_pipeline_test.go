@@ -124,8 +124,9 @@ func TestChunkRelaySlidingWindowRefillsAfterSingleAck(t *testing.T) {
 		}
 	}
 
-	// Release only seq=1. A fixed four-chunk batch would still wait for 2..4;
-	// a sliding window must immediately refill the freed slot with seq=5.
+	// Release only seq=1. A fixed window-sized batch would still wait for the
+	// other in-flight chunks; a sliding window must immediately refill the
+	// freed slot with the next sequence.
 	close(releases[1])
 	select {
 	case seq := <-started:
@@ -133,7 +134,7 @@ func TestChunkRelaySlidingWindowRefillsAfterSingleAck(t *testing.T) {
 			t.Fatalf("next started seq=%d want=%d", seq, totalChunks)
 		}
 	case <-time.After(time.Second):
-		t.Fatal("sliding window did not launch seq=5 after seq=1 ACK")
+		t.Fatal("sliding window did not launch the next chunk after seq=1 ACK")
 	}
 
 	for seq := int64(2); seq <= totalChunks; seq++ {
@@ -194,5 +195,20 @@ func TestChunkRelayPipelineUses12KiBUploadChunks(t *testing.T) {
 	sort.Ints(sizes)
 	if len(sizes) != 2 || sizes[0] != 100 || sizes[1] != mtProtoChunkRelayUploadBytes {
 		t.Fatalf("sizes=%v", sizes)
+	}
+}
+
+func TestChunkRelayWindow3Profile(t *testing.T) {
+	if mtProtoChunkRelayUpWindow != 3 {
+		t.Fatalf("window=%d want=3", mtProtoChunkRelayUpWindow)
+	}
+	if mtProtoChunkRelayPrimaryRequests != 12 {
+		t.Fatalf("primary requests=%d want=12", mtProtoChunkRelayPrimaryRequests)
+	}
+	if mtProtoChunkRelayGlobalHTTPRequests != 18 {
+		t.Fatalf("global HTTP requests=%d want=18", mtProtoChunkRelayGlobalHTTPRequests)
+	}
+	if mtProtoChunkRelayPipelineMode != "sliding-w3" {
+		t.Fatalf("pipeline mode=%q want=%q", mtProtoChunkRelayPipelineMode, "sliding-w3")
 	}
 }
