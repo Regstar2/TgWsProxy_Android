@@ -2,8 +2,9 @@ import baseWorker from "./worker.js";
 import { connect } from "cloudflare:sockets";
 import { DurableObject } from "cloudflare:workers";
 
-const REVISION = "chunk-relay-mtproto-v5";
-const RELAY_MAX_CHUNK_BYTES = 8 * 1024;
+const REVISION = "chunk-relay-mtproto-v6";
+const RELAY_MAX_UPLOAD_CHUNK_BYTES = 12 * 1024;
+const RELAY_MAX_DOWN_CHUNK_BYTES = 8 * 1024;
 const DIAG_MAX_CHUNK_BYTES = 12 * 1024;
 const MAX_QUEUE_BYTES = 2 * 1024 * 1024;
 const MAX_POLL_WAIT_MS = 6000;
@@ -71,8 +72,8 @@ export class ChunkRelaySession extends DurableObject {
     this.upPending.clear();
   }
 
-  async waitForDrain() {
-    if (this.queueBytes < MAX_QUEUE_BYTES || this.closed) return;
+  async waitForDrain(requiredBytes) {
+    if (this.queueBytes + requiredBytes <= MAX_QUEUE_BYTES || this.closed) return;
     await new Promise((resolve) => this.drainWaiters.add(resolve));
   }
 
@@ -123,10 +124,10 @@ export class ChunkRelaySession extends DurableObject {
         return;
       }
       const bytes = value instanceof Uint8Array ? value : new Uint8Array(value || 0);
-      for (let offset = 0; offset < bytes.byteLength; offset += RELAY_MAX_CHUNK_BYTES) {
-        const chunk = bytes.slice(offset, Math.min(offset + RELAY_MAX_CHUNK_BYTES, bytes.byteLength));
+      for (let offset = 0; offset < bytes.byteLength; offset += RELAY_MAX_DOWN_CHUNK_BYTES) {
+        const chunk = bytes.slice(offset, Math.min(offset + RELAY_MAX_DOWN_CHUNK_BYTES, bytes.byteLength));
         while (!this.closed && this.queueBytes + chunk.byteLength > MAX_QUEUE_BYTES) {
-          await this.waitForDrain();
+          await this.waitForDrain(chunk.byteLength);
         }
         if (this.closed) return;
         this.queue.push(chunk);
@@ -189,7 +190,7 @@ export class ChunkRelaySession extends DurableObject {
     }
 
     const body = new Uint8Array(await request.arrayBuffer());
-    if (!body.byteLength || body.byteLength > RELAY_MAX_CHUNK_BYTES) {
+    if (!body.byteLength || body.byteLength > RELAY_MAX_UPLOAD_CHUNK_BYTES) {
       return new Response("bad size", { status: 413, headers: headers() });
     }
 

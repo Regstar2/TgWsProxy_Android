@@ -6,6 +6,7 @@ import (
 	"net/url"
 	"sort"
 	"strconv"
+	"sync"
 	"testing"
 	"time"
 )
@@ -29,7 +30,7 @@ func TestChunkRelayPipelineStartsWindowBeforeWaitingForAck(t *testing.T) {
 		return http.StatusNoContent, headers, nil, nil
 	})
 
-	payload := make([]byte, mtProtoChunkRelayBytes*mtProtoChunkRelayUpWindow)
+	payload := make([]byte, mtProtoChunkRelayUploadBytes*mtProtoChunkRelayUpWindow)
 	done := make(chan error, 1)
 	go func() {
 		_, err := writePipelinedMtProtoChunkRelay(conn, payload)
@@ -97,7 +98,7 @@ func TestChunkRelaySlidingWindowRefillsAfterSingleAck(t *testing.T) {
 		return http.StatusNoContent, headers, nil, nil
 	})
 
-	payload := make([]byte, mtProtoChunkRelayBytes*totalChunks)
+	payload := make([]byte, mtProtoChunkRelayUploadBytes*totalChunks)
 	done := make(chan error, 1)
 	go func() {
 		_, err := writePipelinedMtProtoChunkRelay(conn, payload)
@@ -153,5 +154,45 @@ func TestChunkRelaySlidingWindowRefillsAfterSingleAck(t *testing.T) {
 	}
 	if conn.upBytes != int64(len(payload)) {
 		t.Fatalf("upBytes=%d want=%d", conn.upBytes, len(payload))
+	}
+}
+
+func TestChunkRelayPipelineUses12KiBUploadChunks(t *testing.T) {
+	if mtProtoChunkRelayUploadBytes != 12*1024 {
+		t.Fatalf("upload chunk bytes=%d want=%d", mtProtoChunkRelayUploadBytes, 12*1024)
+	}
+
+	var mu sync.Mutex
+	var sizes []int
+	conn := newTestChunkRelayConn(t, func(_ context.Context, action string, query url.Values, body []byte) (int, http.Header, []byte, error) {
+		if action != "up" {
+			t.Fatalf("action=%s", action)
+		}
+		seq, err := strconv.ParseInt(query.Get("seq"), 10, 64)
+		if err != nil {
+			t.Fatal(err)
+		}
+		mu.Lock()
+		sizes = append(sizes, len(body))
+		mu.Unlock()
+		headers := make(http.Header)
+		headers.Set("X-Tgws-Chunk-Ack", strconv.FormatInt(seq, 10))
+		return http.StatusNoContent, headers, nil, nil
+	})
+
+	payload := make([]byte, mtProtoChunkRelayUploadBytes+100)
+	n, err := writePipelinedMtProtoChunkRelay(conn, payload)
+	if err != nil {
+		t.Fatalf("pipeline write: %v", err)
+	}
+	if n != len(payload) {
+		t.Fatalf("n=%d want=%d", n, len(payload))
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	sort.Ints(sizes)
+	if len(sizes) != 2 || sizes[0] != 100 || sizes[1] != mtProtoChunkRelayUploadBytes {
+		t.Fatalf("sizes=%v", sizes)
 	}
 }

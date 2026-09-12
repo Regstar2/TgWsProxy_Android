@@ -42,7 +42,7 @@ func TestChunkRelayPipelineHedgesOnlyOldestUnacked(t *testing.T) {
 		return http.StatusNoContent, headers, nil, nil
 	})
 
-	payload := make([]byte, mtProtoChunkRelayBytes*mtProtoChunkRelayUpWindow)
+	payload := make([]byte, mtProtoChunkRelayUploadBytes*mtProtoChunkRelayUpWindow)
 	started := time.Now()
 	n, err := writePipelinedMtProtoChunkRelay(conn, payload)
 	if err != nil {

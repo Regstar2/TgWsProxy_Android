@@ -32,9 +32,10 @@ func dialMtProtoChunkRelayFrameSocket(ctx context.Context, domain, path, logPref
 		enableMtProtoChunkRelayRequestLimit(chunkConn)
 		if logInfo != nil {
 			logInfo.Printf(
-				"%s MTProto Worker chunk relay upload pipeline session_id=%s window=%d primary_requests=%d global_http_requests=%d hol_hedge_delay_ms=%d hedge_policy=oldest_unacked",
+				"%s MTProto Worker chunk relay upload pipeline session_id=%s upload_chunk_bytes=%d window=%d primary_requests=%d global_http_requests=%d hol_hedge_delay_ms=%d hedge_policy=oldest_unacked",
 				logPrefix,
 				sessionID,
+				mtProtoChunkRelayUploadBytes,
 				mtProtoChunkRelayUpWindow,
 				mtProtoChunkRelayPrimaryRequests,
 				mtProtoChunkRelayGlobalHTTPRequests,

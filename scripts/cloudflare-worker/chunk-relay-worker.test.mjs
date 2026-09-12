@@ -78,3 +78,48 @@ test("relay binds a session to one target", async (t) => {
   ));
   assert.equal(second.status, 502);
 });
+
+test("relay accepts 12 KiB upload chunks and rejects larger bodies", async (t) => {
+  const writes = [];
+  const oldConnect = globalThis.__chunkRelayConnect;
+  globalThis.__chunkRelayConnect = () => makeSocket(writes);
+  t.after(() => { globalThis.__chunkRelayConnect = oldConnect; });
+
+  const relay = new mod.ChunkRelaySession({}, {});
+  const open = await relay.fetch(new Request(
+    "https://example.workers.dev/chunk-relay/open?sid=session_size_123&dst=149.154.167.51",
+    { method: "POST" },
+  ));
+  assert.equal(open.status, 204);
+
+  const ok = await relay.fetch(new Request(
+    "https://example.workers.dev/chunk-relay/up?sid=session_size_123&dst=149.154.167.51&seq=1",
+    { method: "POST", body: new Uint8Array(12 * 1024) },
+  ));
+  assert.equal(ok.status, 204);
+  assert.equal(ok.headers.get("X-Tgws-Chunk-Ack"), "1");
+  assert.equal(writes.length, 1);
+  assert.equal(writes[0].byteLength, 12 * 1024);
+
+  const tooLarge = await relay.fetch(new Request(
+    "https://example.workers.dev/chunk-relay/up?sid=session_size_123&dst=149.154.167.51&seq=2",
+    { method: "POST", body: new Uint8Array(12 * 1024 + 1) },
+  ));
+  assert.equal(tooLarge.status, 413);
+  assert.equal(writes.length, 1);
+});
+
+test("backpressure waits when the next downstream chunk would exceed the queue limit", async () => {
+  const relay = new mod.ChunkRelaySession({}, {});
+  relay.queueBytes = 2 * 1024 * 1024 - 1;
+
+  let resolved = false;
+  const wait = relay.waitForDrain(2).then(() => { resolved = true; });
+  await Promise.resolve();
+  assert.equal(resolved, false);
+
+  relay.queueBytes -= 2;
+  relay.wakeDrain();
+  await wait;
+  assert.equal(resolved, true);
+});

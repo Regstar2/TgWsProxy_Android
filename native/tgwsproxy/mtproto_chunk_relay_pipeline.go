@@ -14,6 +14,7 @@ import (
 )
 
 const (
+	mtProtoChunkRelayUploadBytes       = 12 * 1024
 	mtProtoChunkRelayUpWindow           = 4
 	mtProtoChunkRelayPrimaryRequests    = 16
 	mtProtoChunkRelayGlobalHTTPRequests = 24
@@ -269,10 +270,10 @@ func writePipelinedMtProtoChunkRelay(c *mtProtoChunkRelayConn, data []byte) (int
 		return 0, net.ErrClosed
 	}
 
-	specs := make([]mtProtoChunkUploadSpec, 0, (len(data)+mtProtoChunkRelayBytes-1)/mtProtoChunkRelayBytes)
+	specs := make([]mtProtoChunkUploadSpec, 0, (len(data)+mtProtoChunkRelayUploadBytes-1)/mtProtoChunkRelayUploadBytes)
 	baseSeq := c.upSeq
-	for start := 0; start < len(data); start += mtProtoChunkRelayBytes {
-		end := start + mtProtoChunkRelayBytes
+	for start := 0; start < len(data); start += mtProtoChunkRelayUploadBytes {
+		end := start + mtProtoChunkRelayUploadBytes
 		if end > len(data) {
 			end = len(data)
 		}
@@ -375,11 +376,12 @@ func writePipelinedMtProtoChunkRelay(c *mtProtoChunkRelayConn, data []byte) (int
 
 			if logInfo != nil && (spec.seq <= 2 || c.upBytes%(64*1024) < int64(chunkBytes)) {
 				logInfo.Printf(
-					"MTProto Worker chunk relay up session_id=%s seq=%d bytes=%d confirmed_bytes=%d upload_window=%d pipeline=%s",
+					"MTProto Worker chunk relay up session_id=%s seq=%d bytes=%d confirmed_bytes=%d upload_chunk_bytes=%d upload_window=%d pipeline=%s",
 					c.sessionID,
 					spec.seq,
 					chunkBytes,
 					c.upBytes,
+					mtProtoChunkRelayUploadBytes,
 					mtProtoChunkRelayUpWindow,
 					mtProtoChunkRelayPipelineMode,
 				)
