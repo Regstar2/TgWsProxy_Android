@@ -239,11 +239,30 @@ func (c *mtProtoWorkerConnector) Connect(
 	}
 
 	settings := getRuntimeSettings()
-	candidates := settings.Worker.Failover.effectiveCandidates(settings.Worker.Domain)
+	// The frontend and Worker connector independently derive the same opaque
+	// identifier from relay_init, so Worker selection is deterministic for the
+	// lifetime of this Telegram session without exposing relay key material.
+	sessionID := mtproxyfrontend.SessionIDForRequest(request)
+	candidates, stickyIndex := workerCandidatesForSession(
+		settings.Worker.Failover,
+		settings.Worker.Domain,
+		sessionID,
+	)
 	if len(candidates) == 0 {
 		result.Reason = "worker_not_configured"
 		result.Err = fmt.Errorf("MTProto Worker backend is not configured")
 		return nil, result
+	}
+	if logInfo != nil {
+		logInfo.Printf(
+			"MTProto Worker session selection session_id=%s strategy=%s candidate_count=%d sticky_index=%d primary_worker_id=%s primary_worker_host=%s",
+			sessionID,
+			mtProtoStatusField(settings.Worker.Failover.SelectionStrategy),
+			len(candidates),
+			stickyIndex,
+			candidates[0].ID,
+			candidates[0].Domain,
+		)
 	}
 
 	destination := buildMtProtoWorkerDestinationPlan(
@@ -295,10 +314,6 @@ func (c *mtProtoWorkerConnector) Connect(
 		return nil, result
 	}
 
-	// The frontend and Worker connector independently derive the same opaque
-	// identifier from relay_init, so every lifecycle log can be correlated
-	// without exposing relay key material or relying on log ordering.
-	sessionID := mtproxyfrontend.SessionIDForRequest(request)
 	var lastErr error
 	var lastReason string
 	for i := 0; i < maxAttempts; i++ {
