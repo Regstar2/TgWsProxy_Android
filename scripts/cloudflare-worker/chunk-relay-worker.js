@@ -11,6 +11,12 @@ function headers(extra = {}) {
   return { "Cache-Control": "no-store", "X-Tgws-Chunk-Relay-Revision": REVISION, ...extra };
 }
 
+function randomBytes(size) {
+  const bytes = new Uint8Array(size);
+  crypto.getRandomValues(bytes);
+  return bytes;
+}
+
 export class ChunkRelaySession extends DurableObject {
   constructor(ctx, env) {
     super(ctx, env);
@@ -111,6 +117,20 @@ export class ChunkRelaySession extends DurableObject {
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
+
+    if (url.pathname === "/diag/fresh-upload") {
+      if (request.method !== "POST") return new Response("method", { status: 405, headers: headers() });
+      const body = new Uint8Array(await request.arrayBuffer());
+      if (!body.byteLength || body.byteLength > MAX_CHUNK_BYTES) return new Response("bad size", { status: 413, headers: headers() });
+      return Response.json({ ok: true, bytes: body.byteLength, revision: REVISION }, { headers: headers() });
+    }
+
+    if (url.pathname === "/diag/fresh-download") {
+      const size = Number.parseInt(url.searchParams.get("size") || "0", 10);
+      if (!Number.isSafeInteger(size) || size <= 0 || size > MAX_CHUNK_BYTES) return new Response("bad size", { status: 400, headers: headers() });
+      return new Response(randomBytes(size), { status: 200, headers: headers({ "Content-Type": "application/octet-stream" }) });
+    }
+
     if (url.pathname.startsWith("/chunk-relay/")) {
       const sid = (url.searchParams.get("sid") || "").trim();
       if (!/^[A-Za-z0-9_-]{8,128}$/.test(sid)) return new Response("invalid sid", { status: 400 });
