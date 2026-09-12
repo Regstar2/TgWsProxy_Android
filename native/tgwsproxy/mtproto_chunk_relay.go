@@ -18,12 +18,13 @@ import (
 )
 
 const (
-	mtProtoChunkRelayBytes       = 8 * 1024
-	mtProtoChunkRelayMaxRetries  = 3
-	mtProtoChunkRelayOpenTimeout = 10 * time.Second
-	mtProtoChunkRelayUpTimeout   = 5 * time.Second
-	mtProtoChunkRelayDownTimeout = 10 * time.Second
-	mtProtoChunkRelayPollWaitMS  = 6000
+	mtProtoChunkRelayBytes        = 8 * 1024
+	mtProtoChunkRelayMaxRetries   = 3
+	mtProtoChunkRelayOpenTimeout  = 10 * time.Second
+	mtProtoChunkRelayUpTimeout    = 5 * time.Second
+	mtProtoChunkRelayUpHedgeDelay = 400 * time.Millisecond
+	mtProtoChunkRelayDownTimeout  = 10 * time.Second
+	mtProtoChunkRelayPollWaitMS   = 6000
 )
 
 // Each relay request still uses a fresh TCP/TLS connection. Sharing only the
@@ -105,7 +106,7 @@ func dialMtProtoChunkRelay(
 
 	if logInfo != nil {
 		logInfo.Printf(
-			"%s MTProto Worker chunk relay ready session_id=%s worker_host=%s worker_dst=%s chunk_bytes=%d max_retries=%d poll_wait_ms=%d up_timeout_ms=%d down_timeout_ms=%d tls_session_cache=true revision=%s",
+			"%s MTProto Worker chunk relay ready session_id=%s worker_host=%s worker_dst=%s chunk_bytes=%d max_retries=%d poll_wait_ms=%d up_timeout_ms=%d down_timeout_ms=%d up_hedge_delay_ms=%d tls_session_cache=true revision=%s",
 			logPrefix,
 			sessionID,
 			domain,
@@ -115,6 +116,7 @@ func dialMtProtoChunkRelay(
 			mtProtoChunkRelayPollWaitMS,
 			mtProtoChunkRelayUpTimeout.Milliseconds(),
 			mtProtoChunkRelayDownTimeout.Milliseconds(),
+			mtProtoChunkRelayUpHedgeDelay.Milliseconds(),
 			mtProtoStatusField(headers.Get("X-Tgws-Chunk-Relay-Revision")),
 		)
 	}
@@ -191,9 +193,17 @@ func (c *mtProtoChunkRelayConn) requestWithRetry(
 ) (int, http.Header, []byte, error) {
 	var lastErr error
 	for attempt := 0; attempt <= mtProtoChunkRelayMaxRetries; attempt++ {
-		ctx, cancel := c.requestContext(parent, direction)
-		status, headers, responseBody, err := c.request(ctx, action, query, body)
-		cancel()
+		var status int
+		var headers http.Header
+		var responseBody []byte
+		var err error
+		if action == "up" && direction == "up" {
+			status, headers, responseBody, err = c.requestUpHedgeRound(parent, query, body, seq)
+		} else {
+			ctx, cancel := c.requestContext(parent, direction)
+			status, headers, responseBody, err = c.request(ctx, action, query, body)
+			cancel()
+		}
 		if err == nil {
 			return status, headers, responseBody, nil
 		}
@@ -225,6 +235,104 @@ func (c *mtProtoChunkRelayConn) requestWithRetry(
 		}
 	}
 	return 0, nil, nil, lastErr
+}
+
+type chunkRelayAttemptResult struct {
+	status       int
+	headers      http.Header
+	responseBody []byte
+	err          error
+	leg          string
+}
+
+func (c *mtProtoChunkRelayConn) requestUpHedgeRound(
+	parent context.Context,
+	query url.Values,
+	body []byte,
+	seq int64,
+) (int, http.Header, []byte, error) {
+	if parent == nil {
+		parent = context.Background()
+	}
+	roundCtx, roundCancel := context.WithCancel(parent)
+	defer roundCancel()
+
+	results := make(chan chunkRelayAttemptResult, 2)
+	launch := func(leg string) {
+		go func() {
+			ctx, cancel := c.requestContext(roundCtx, "up")
+			status, headers, responseBody, err := c.request(ctx, "up", query, body)
+			cancel()
+			results <- chunkRelayAttemptResult{
+				status:       status,
+				headers:      headers,
+				responseBody: responseBody,
+				err:          err,
+				leg:          leg,
+			}
+		}()
+	}
+
+	launch("primary")
+	timer := time.NewTimer(mtProtoChunkRelayUpHedgeDelay)
+	defer timer.Stop()
+	hedgeLaunched := false
+	completed := 0
+	var lastErr error
+
+	launchHedge := func(reason string) {
+		if hedgeLaunched {
+			return
+		}
+		hedgeLaunched = true
+		launch("hedge")
+		if logInfo != nil {
+			logInfo.Printf(
+				"MTProto Worker chunk relay hedge session_id=%s direction=up seq=%d delay_ms=%d reason=%s",
+				c.sessionID,
+				seq,
+				mtProtoChunkRelayUpHedgeDelay.Milliseconds(),
+				reason,
+			)
+		}
+	}
+
+	for {
+		select {
+		case result := <-results:
+			completed++
+			if result.err == nil {
+				roundCancel()
+				if result.leg == "hedge" && logInfo != nil {
+					logInfo.Printf(
+						"MTProto Worker chunk relay hedge won session_id=%s direction=up seq=%d",
+						c.sessionID,
+						seq,
+					)
+				}
+				return result.status, result.headers, result.responseBody, nil
+			}
+			lastErr = result.err
+			if !hedgeLaunched {
+				if !timer.Stop() {
+					select {
+					case <-timer.C:
+					default:
+					}
+				}
+				launchHedge("primary_error")
+			}
+			if hedgeLaunched && completed >= 2 {
+				return 0, nil, nil, lastErr
+			}
+		case <-timer.C:
+			launchHedge("delay")
+		case <-parent.Done():
+			return 0, nil, nil, parent.Err()
+		case <-c.lifeCtx.Done():
+			return 0, nil, nil, net.ErrClosed
+		}
+	}
 }
 
 func (c *mtProtoChunkRelayConn) requestContext(parent context.Context, direction string) (context.Context, context.CancelFunc) {
