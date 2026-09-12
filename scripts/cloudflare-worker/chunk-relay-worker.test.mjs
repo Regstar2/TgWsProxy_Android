@@ -1,0 +1,80 @@
+import assert from "node:assert/strict";
+import { readFile } from "node:fs/promises";
+import test from "node:test";
+
+const source = (await readFile(new URL("./chunk-relay-worker.js", import.meta.url), "utf8"))
+  .replace('import baseWorker from "./worker.js";', 'const baseWorker = { fetch() { return new Response("base", { status: 200 }); } };')
+  .replace('import { connect } from "cloudflare:sockets";', 'const connect = (...args) => globalThis.__chunkRelayConnect(...args);')
+  .replace('import { DurableObject } from "cloudflare:workers";', 'class DurableObject { constructor(ctx, env) { this.ctx = ctx; this.env = env; } }');
+
+const mod = await import("data:text/javascript;base64," + Buffer.from(source).toString("base64"));
+
+function makeSocket(writes) {
+  return {
+    opened: Promise.resolve(),
+    writable: {
+      getWriter() {
+        return {
+          async write(data) { writes.push(new Uint8Array(data).slice()); },
+        };
+      },
+    },
+    readable: {
+      getReader() {
+        return { read: () => new Promise(() => {}) };
+      },
+    },
+    async close() {},
+  };
+}
+
+test("duplicate upload sequence is written only once", async (t) => {
+  const writes = [];
+  const oldConnect = globalThis.__chunkRelayConnect;
+  globalThis.__chunkRelayConnect = ({ hostname }) => {
+    assert.equal(hostname, "149.154.167.51");
+    return makeSocket(writes);
+  };
+  t.after(() => { globalThis.__chunkRelayConnect = oldConnect; });
+
+  const relay = new mod.ChunkRelaySession({}, {});
+  const open = await relay.fetch(new Request(
+    "https://example.workers.dev/chunk-relay/open?sid=session_test_123&dst=149.154.167.51",
+    { method: "POST" },
+  ));
+  assert.equal(open.status, 204);
+
+  const body = new Uint8Array([1, 2, 3, 4]);
+  const makeUp = () => relay.fetch(new Request(
+    "https://example.workers.dev/chunk-relay/up?sid=session_test_123&dst=149.154.167.51&seq=1",
+    { method: "POST", body },
+  ));
+
+  const [first, retry] = await Promise.all([makeUp(), makeUp()]);
+  assert.equal(first.status, 204);
+  assert.equal(retry.status, 204);
+  assert.equal(first.headers.get("X-Tgws-Chunk-Ack"), "1");
+  assert.equal(retry.headers.get("X-Tgws-Chunk-Ack"), "1");
+  assert.equal(writes.length, 1);
+  assert.deepEqual([...writes[0]], [...body]);
+});
+
+test("relay binds a session to one target", async (t) => {
+  const writes = [];
+  const oldConnect = globalThis.__chunkRelayConnect;
+  globalThis.__chunkRelayConnect = () => makeSocket(writes);
+  t.after(() => { globalThis.__chunkRelayConnect = oldConnect; });
+
+  const relay = new mod.ChunkRelaySession({}, {});
+  const first = await relay.fetch(new Request(
+    "https://example.workers.dev/chunk-relay/open?sid=session_test_456&dst=149.154.167.51",
+    { method: "POST" },
+  ));
+  assert.equal(first.status, 204);
+
+  const second = await relay.fetch(new Request(
+    "https://example.workers.dev/chunk-relay/open?sid=session_test_456&dst=149.154.167.91",
+    { method: "POST" },
+  ));
+  assert.equal(second.status, 502);
+});
