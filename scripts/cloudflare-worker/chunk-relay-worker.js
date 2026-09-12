@@ -2,10 +2,11 @@ import baseWorker from "./worker.js";
 import { connect } from "cloudflare:sockets";
 import { DurableObject } from "cloudflare:workers";
 
-const REVISION = "chunk-relay-mtproto-v3";
+const REVISION = "chunk-relay-mtproto-v4";
 const RELAY_MAX_CHUNK_BYTES = 8 * 1024;
 const DIAG_MAX_CHUNK_BYTES = 12 * 1024;
 const MAX_QUEUE_BYTES = 2 * 1024 * 1024;
+const MAX_POLL_WAIT_MS = 6000;
 
 function headers(extra = {}) {
   return { "Cache-Control": "no-store", "X-Tgws-Chunk-Relay-Revision": REVISION, ...extra };
@@ -121,7 +122,7 @@ export class ChunkRelaySession extends DurableObject {
     if (this.pending || this.queue.length || this.closed) return;
     await new Promise((resolve) => {
       const done = () => { clearTimeout(timer); this.waiters.delete(done); resolve(); };
-      const timer = setTimeout(done, Math.min(Math.max(ms, 0), 1000));
+      const timer = setTimeout(done, Math.min(Math.max(ms, 0), MAX_POLL_WAIT_MS));
       this.waiters.add(done);
     });
   }
@@ -236,7 +237,7 @@ export default {
 
     if (url.pathname.startsWith("/chunk-relay/")) {
       const sid = (url.searchParams.get("sid") || "").trim();
-      if (!/^[A-Za-z0-9_-]{8,128}$/.test(sid)) return new Response("invalid sid", { status: 400, headers: headers() });
+      if (!/^[A-Za-z0-9_-]{8,128}$/.test(sid)) return new Response("invalid sid", { status: 400 });
       return env.CHUNK_RELAY.getByName(sid).fetch(request);
     }
     return baseWorker.fetch(request, env, ctx);
