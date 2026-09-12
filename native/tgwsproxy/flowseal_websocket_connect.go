@@ -14,11 +14,26 @@ import (
 	"time"
 )
 
+const workerChunkRelayExperimentEnabled = true
+
 func dialFlowsealWorkerCandidate(domain, path, logPrefix string) (mtProtoFrameSocket, error) {
 	return dialFlowsealWorkerCandidateContext(context.Background(), domain, path, logPrefix)
 }
 
 func dialFlowsealWorkerCandidateContext(ctx context.Context, domain, path, logPrefix string) (mtProtoFrameSocket, error) {
+	if workerChunkRelayExperimentEnabled {
+		socket, err := dialMtProtoChunkRelayFrameSocket(ctx, domain, path, logPrefix)
+		if err != nil {
+			logDomainConnectFailure(logPrefix, domain, domain, err)
+			return nil, err
+		}
+		if logInfo != nil {
+			logInfo.Printf("%s Worker transport=chunk_relay_http host=%s path=%s chunk_bytes=%d max_retries=%d",
+				logPrefix, domain, path, mtProtoChunkRelayBytes, mtProtoChunkRelayMaxRetries)
+		}
+		return socket, nil
+	}
+
 	ws, err := connectFlowsealRawWebSocketContext(ctx, domain, domain, path, 10)
 	if err != nil {
 		logDomainConnectFailure(logPrefix, domain, domain, err)
