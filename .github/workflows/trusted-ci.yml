@@ -17,6 +17,30 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  worker-transport:
+    name: Worker transport regression
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: native/tgwsproxy/go.mod
+          cache-dependency-path: native/tgwsproxy/go.sum
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Native transport and race tests
+        working-directory: native/tgwsproxy
+        run: go test -race ./...
+      - name: Deployed Worker handler tests
+        run: node --test scripts/cloudflare-worker/*.test.mjs
+
   ci:
     name: Windows CI
     runs-on: windows-latest

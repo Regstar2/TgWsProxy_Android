@@ -131,7 +131,15 @@ func ResolveCfWorkerDestination(input WorkerDestinationInput) WorkerDestinationP
 
 	if applyMediaFix {
 		plan.FlowsealMediaFixApplied = true
-		plan.EffectiveDC = mediaFix.DC
+		// Keep Telegram's logical DC/media identity intact. The Flowseal-style
+		// media fix is a physical destination override only: a DC2 media
+		// handshake must stay DC2 media even when TCP is sent to 149.154.167.220.
+		// mediaFix.DC remains only as a fallback for synthetic/unknown routes
+		// that do not carry a valid logical DC.
+		plan.EffectiveDC = input.DCID
+		if plan.EffectiveDC <= 0 {
+			plan.EffectiveDC = mediaFix.DC
+		}
 		plan.EffectiveIsMedia = true
 		plan.WorkerDst = mediaFix.IP
 		plan.WorkerDstSource = WorkerDstSourceFlowsealMediaDC4Fix

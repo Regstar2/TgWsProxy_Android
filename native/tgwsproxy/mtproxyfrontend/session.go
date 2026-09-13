@@ -45,6 +45,7 @@ type StreamTransform func([]byte) []byte
 
 type OutboundRequest struct {
 	DCID          int
+	SignedDC      int16
 	IsMedia       bool
 	IsTestDC      bool
 	Transport     Transport
@@ -136,6 +137,7 @@ func prepareOutboundRequest(
 
 	return OutboundRequest{
 		DCID:          dc,
+		SignedDC:      signedDC,
 		IsMedia:       signedDC < 0,
 		IsTestDC:      isTestDC,
 		Transport:     transport,

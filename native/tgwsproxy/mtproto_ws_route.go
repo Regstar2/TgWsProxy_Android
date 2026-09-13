@@ -306,14 +306,36 @@ func defaultMtProtoCFProxyDial(domain, path, logPrefix string) (mtProtoFrameSock
 }
 
 func mtProtoWebSocketConn(ws mtProtoFrameSocket, relayInit []byte, remote string) (net.Conn, error) {
+	return mtProtoWebSocketConnWithFraming(ws, relayInit, remote, true)
+}
+
+// mtProtoWorkerWebSocketConn mirrors Flowseal's cf_worker fallback semantics:
+// relay_init is sent first, then each transformed TCP chunk is forwarded as one
+// WebSocket message without MTProto packet-aware splitting.
+func mtProtoWorkerWebSocketConn(ws mtProtoFrameSocket, relayInit []byte, remote string) (net.Conn, error) {
+	return mtProtoWebSocketConnWithFraming(ws, relayInit, remote, false)
+}
+
+func mtProtoWebSocketConnWithFraming(
+	ws mtProtoFrameSocket,
+	relayInit []byte,
+	remote string,
+	splitOutboundPackets bool,
+) (net.Conn, error) {
 	ws = wrapMtProtoFrameSocket(ws)
 	if err := ws.Send(relayInit); err != nil {
 		return nil, fmt.Errorf("write relay init to WebSocket %s: %w", remote, err)
 	}
-	splitter, err := newMsgSplitter(relayInit)
-	if err != nil {
-		return nil, fmt.Errorf("create packet splitter for WebSocket %s: %w", remote, err)
+
+	var splitter *MsgSplitter
+	if splitOutboundPackets {
+		var err error
+		splitter, err = newMsgSplitter(relayInit)
+		if err != nil {
+			return nil, fmt.Errorf("create packet splitter for WebSocket %s: %w", remote, err)
+		}
 	}
+
 	return &mtProtoWebSocketStream{
 		socket:   ws,
 		splitter: splitter,

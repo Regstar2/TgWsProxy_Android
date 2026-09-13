@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+	"time"
 )
 
 // mtProtoMaxWebSocketMessageLen mirrors the current Flowseal runtime guard.
@@ -39,15 +40,69 @@ func (s *mtProtoSafeFrameSocket) messageLimit() int {
 }
 
 func (s *mtProtoSafeFrameSocket) Send(data []byte) error {
-	return s.raw.Send(data)
+	if s == nil || s.raw == nil {
+		return fmt.Errorf("WebSocket closed")
+	}
+	if len(data) > s.messageLimit() {
+		return fmt.Errorf("WS message too large: %d bytes", len(data))
+	}
+	return s.writeFrameFull(opBinary, data)
 }
 
 func (s *mtProtoSafeFrameSocket) SendBatch(parts [][]byte) error {
-	return s.raw.SendBatch(parts)
+	for _, part := range parts {
+		if err := s.Send(part); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *mtProtoSafeFrameSocket) writeFrameFull(opcode int, payload []byte) error {
+	if s.raw.closed.Load() {
+		return fmt.Errorf("WebSocket closed")
+	}
+	frame := s.raw.buildFrame(opcode, payload, true)
+	s.raw.writeMu.Lock()
+	defer s.raw.writeMu.Unlock()
+	return writeFull(s.raw.conn, frame)
+}
+
+// writeFull turns net.Conn.Write into the same all-bytes-or-error contract that
+// Flowseal gets from StreamWriter.write()+drain(). A short successful Write is
+// legal for io.Writer and must not silently truncate a WebSocket frame.
+func writeFull(writer io.Writer, data []byte) error {
+	for len(data) > 0 {
+		n, err := writer.Write(data)
+		if n > 0 {
+			data = data[n:]
+		}
+		if err != nil {
+			return err
+		}
+		if n == 0 {
+			return io.ErrShortWrite
+		}
+	}
+	return nil
 }
 
 func (s *mtProtoSafeFrameSocket) Close() {
-	s.raw.Close()
+	if !s.raw.closed.Swap(true) {
+		_ = s.raw.conn.Close()
+	}
+}
+
+func (s *mtProtoSafeFrameSocket) SetDeadline(t time.Time) error {
+	return s.raw.conn.SetDeadline(t)
+}
+
+func (s *mtProtoSafeFrameSocket) SetReadDeadline(t time.Time) error {
+	return s.raw.conn.SetReadDeadline(t)
+}
+
+func (s *mtProtoSafeFrameSocket) SetWriteDeadline(t time.Time) error {
+	return s.raw.conn.SetWriteDeadline(t)
 }
 
 func (s *mtProtoSafeFrameSocket) Recv() ([]byte, error) {
@@ -62,23 +117,15 @@ func (s *mtProtoSafeFrameSocket) Recv() ([]byte, error) {
 
 		switch opcode {
 		case opClose:
-			closePayload := payload
-			if len(closePayload) > 2 {
-				closePayload = closePayload[:2]
-			}
-			reply := s.raw.buildFrame(opClose, closePayload, true)
-			s.raw.writeMu.Lock()
-			_, _ = s.raw.conn.Write(reply)
-			s.raw.writeMu.Unlock()
-			s.raw.closed.Store(true)
-			_ = s.raw.conn.Close()
+			s.Close()
 			return nil, io.EOF
 
 		case opPing:
-			pong := s.raw.buildFrame(opPong, payload, true)
-			s.raw.writeMu.Lock()
-			_, _ = s.raw.conn.Write(pong)
-			s.raw.writeMu.Unlock()
+			if err := s.writeFrameFull(opPong, payload); err != nil {
+				s.raw.closed.Store(true)
+				_ = s.raw.conn.Close()
+				return nil, err
+			}
 			continue
 
 		case opPong:
@@ -184,7 +231,7 @@ func (p *WorkerWsPool) GetForSession(key WorkerPoolKey) *RawWebSocket {
 		p.idle[key] = bucket
 
 		age := now - entry.created
-		if age > p.maxAge || entry.ws.closed.Load() {
+		if age > p.maxAge || !p.reusable(entry.ws) {
 			go entry.ws.Close()
 			continue
 		}

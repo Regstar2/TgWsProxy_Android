@@ -12,9 +12,11 @@ import (
 )
 
 type frameTestConn struct {
-	reader *bytes.Reader
-	writes bytes.Buffer
-	closed bool
+	reader    *bytes.Reader
+	writes    bytes.Buffer
+	closed    bool
+	maxWrite  int
+	writeCalls int
 }
 
 func newFrameTestRaw(input []byte) (*RawWebSocket, *frameTestConn) {
@@ -30,6 +32,10 @@ func (c *frameTestConn) Read(p []byte) (int, error) {
 }
 
 func (c *frameTestConn) Write(p []byte) (int, error) {
+	c.writeCalls++
+	if c.maxWrite > 0 && len(p) > c.maxWrite {
+		p = p[:c.maxWrite]
+	}
 	return c.writes.Write(p)
 }
 
@@ -68,6 +74,57 @@ func testServerFrame(opcode int, payload []byte, fin bool) []byte {
 		copy(frame[10:], payload)
 		return frame
 	}
+}
+
+func clientFramePayloadLengths(t *testing.T, data []byte) []int {
+	t.Helper()
+	reader := bytes.NewReader(data)
+	lengths := make([]int, 0, 4)
+	for reader.Len() > 0 {
+		first, err := reader.ReadByte()
+		if err != nil {
+			t.Fatalf("read frame first byte: %v", err)
+		}
+		if first&0x0F != opBinary {
+			t.Fatalf("opcode=%d want=%d", first&0x0F, opBinary)
+		}
+		second, err := reader.ReadByte()
+		if err != nil {
+			t.Fatalf("read frame second byte: %v", err)
+		}
+		if second&0x80 == 0 {
+			t.Fatal("client frame must be masked")
+		}
+
+		payloadLen := uint64(second & 0x7F)
+		switch payloadLen {
+		case 126:
+			var extended [2]byte
+			if _, err := io.ReadFull(reader, extended[:]); err != nil {
+				t.Fatalf("read 16-bit payload length: %v", err)
+			}
+			payloadLen = uint64(binary.BigEndian.Uint16(extended[:]))
+		case 127:
+			var extended [8]byte
+			if _, err := io.ReadFull(reader, extended[:]); err != nil {
+				t.Fatalf("read 64-bit payload length: %v", err)
+			}
+			payloadLen = binary.BigEndian.Uint64(extended[:])
+		}
+
+		var mask [4]byte
+		if _, err := io.ReadFull(reader, mask[:]); err != nil {
+			t.Fatalf("read mask: %v", err)
+		}
+		if payloadLen > uint64(reader.Len()) {
+			t.Fatalf("payload length=%d remaining=%d", payloadLen, reader.Len())
+		}
+		if _, err := reader.Seek(int64(payloadLen), io.SeekCurrent); err != nil {
+			t.Fatalf("skip payload: %v", err)
+		}
+		lengths = append(lengths, int(payloadLen))
+	}
+	return lengths
 }
 
 func TestMtProtoSafeFrameSocketReassemblesFragmentedMessage(t *testing.T) {
@@ -141,6 +198,37 @@ func TestMtProtoSafeFrameSocketHandlesPingBetweenFragments(t *testing.T) {
 	}
 	if conn.writes.Len() == 0 {
 		t.Fatal("ping must produce a pong frame")
+	}
+}
+
+func TestMtProtoSafeFrameSocketPreservesLargeOutboundMessage(t *testing.T) {
+	raw, conn := newFrameTestRaw(nil)
+	socket := &mtProtoSafeFrameSocket{raw: raw}
+	payload := bytes.Repeat([]byte{0x5A}, 65536)
+	if err := socket.Send(payload); err != nil {
+		t.Fatal(err)
+	}
+	lengths := clientFramePayloadLengths(t, conn.writes.Bytes())
+	if len(lengths) != 1 || lengths[0] != len(payload) {
+		t.Fatalf("frame lengths=%v want=[%d]", lengths, len(payload))
+	}
+}
+
+func TestMtProtoSafeFrameSocketCompletesShortWrites(t *testing.T) {
+	raw, conn := newFrameTestRaw(nil)
+	conn.maxWrite = 7
+	socket := &mtProtoSafeFrameSocket{raw: raw}
+	payload := bytes.Repeat([]byte{0xA5}, 256)
+
+	if err := socket.Send(payload); err != nil {
+		t.Fatalf("send with short writer: %v", err)
+	}
+	if conn.writeCalls <= 1 {
+		t.Fatalf("write calls=%d, want multiple short writes", conn.writeCalls)
+	}
+	lengths := clientFramePayloadLengths(t, conn.writes.Bytes())
+	if len(lengths) != 1 || lengths[0] != len(payload) {
+		t.Fatalf("frame lengths=%v want=[%d]", lengths, len(payload))
 	}
 }
 

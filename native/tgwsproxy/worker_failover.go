@@ -206,6 +206,9 @@ func classifyWorkerConnectFailure(err error) string {
 	if err == nil {
 		return "worker_runtime_failure"
 	}
+	if _, ok := workerCircuitError(err); ok {
+		return "all_workers_circuit_open"
+	}
 	msg := strings.ToLower(err.Error())
 	switch {
 	case strings.Contains(msg, "timeout"), strings.Contains(msg, "deadline"):
@@ -250,12 +253,21 @@ func tryWorkerFailoverConnect(
 	sessionID string,
 ) (*RawWebSocket, workerFailoverCandidate, int, string, bool) {
 	failover := settings.Worker.Failover
-	candidates := failover.effectiveCandidates(settings.Worker.Domain)
+	candidates, stickyIndex := workerCandidatesForSession(failover, settings.Worker.Domain, sessionID)
 	if len(candidates) == 0 {
 		return nil, workerFailoverCandidate{}, 0, "no_enabled_worker", false
 	}
 	maxAttempts := failover.maxAttemptsFor(len(candidates))
 	noteWorkerFailoverAttemptStarted(failover.SelectedID, len(candidates))
+	logInfo.Printf(
+		"Worker session selection session_id=%s strategy=%s candidate_count=%d sticky_index=%d primary_worker_id=%s primary_worker_host=%s",
+		sessionID,
+		mtProtoStatusField(failover.SelectionStrategy),
+		len(candidates),
+		stickyIndex,
+		candidates[0].ID,
+		candidates[0].Domain,
+	)
 
 	mTag := mediaTag(isMedia)
 	dstIP := strings.TrimSpace(workerDst)

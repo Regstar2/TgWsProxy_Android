@@ -37,7 +37,7 @@ class ProxyRuntimeConfigFactory(
             repository = routePolicyRepository,
             prefs = prefs,
         ).resolve(networkProfile)
-        val runtimePolicy = effectivePolicy.policy.withRuntimeWorkerFallbackRoutes()
+        val runtimePolicy = effectivePolicy.policy
         val ips = ConnectionRuntimeConfig.buildRuntimeTokens(
             dcEntries = dcEntriesProvider(),
             mode = effectivePolicy.legacyMode,
@@ -78,18 +78,4 @@ class ProxyRuntimeConfigFactory(
         const val KEY_FLOWSEAL_MEDIA_FIX_DC = "flowseal_media_fix_dc"
         const val KEY_FLOWSEAL_MEDIA_FIX_IP = "flowseal_media_fix_ip"
     }
-}
-
-internal fun NetworkRoutePolicy.withRuntimeWorkerFallbackRoutes(): NetworkRoutePolicy {
-    if (!allowFallback || enabledRoutes != setOf(RouteKind.WORKER_WS)) {
-        return this
-    }
-    return copy(
-        enabledRoutes = linkedSetOf(
-            RouteKind.WORKER_WS,
-            RouteKind.CF_PROXY_WS,
-            RouteKind.TCP_FALLBACK,
-        ),
-        preferredRoute = RouteKind.WORKER_WS,
-    )
 }

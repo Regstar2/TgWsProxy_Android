@@ -7,8 +7,10 @@ import (
 	"io"
 	"net"
 	"testing"
+	"time"
 
 	"tg-ws-proxy/mtproxyfrontend"
+	"tg-ws-proxy/tgwsroute"
 )
 
 func TestMtProtoWorkerConnectorUsesConfiguredWorkerWithoutFallback(t *testing.T) {
@@ -16,6 +18,7 @@ func TestMtProtoWorkerConnectorUsesConfiguredWorkerWithoutFallback(t *testing.T)
 		settings.Worker.Enabled = true
 		settings.Worker.Domain = "example.workers.dev"
 		settings.Worker.Failover = workerFailoverSettings{}
+		settings.Worker.DestinationMode = tgwsroute.WorkerDestinationPreserveOriginalDst
 		return settings
 	})
 
@@ -57,6 +60,92 @@ func TestMtProtoWorkerConnectorUsesConfiguredWorkerWithoutFallback(t *testing.T)
 	}
 }
 
+func TestMtProtoWorkerConnectorUsesFlowsealDCMapDestination(t *testing.T) {
+	withMtProtoWorkerDCMap(t, map[int]string{2: "149.154.167.220"})
+	withRuntimeSettings(t, func(settings runtimeSettings) runtimeSettings {
+		settings.Worker.Enabled = true
+		settings.Worker.Domain = "example.workers.dev"
+		settings.Worker.Failover = workerFailoverSettings{}
+		settings.Worker.DestinationMode = tgwsroute.WorkerDestinationFlowsealDCMap
+		return settings
+	})
+
+	socket := &fakeMtProtoFrameSocket{}
+	var dialPath string
+	connector := &mtProtoWorkerConnector{
+		dial: func(_, path, _ string) (mtProtoFrameSocket, error) {
+			dialPath = path
+			return socket, nil
+		},
+	}
+	relayInit := buildTestInitWithSignedDC(t, 2)
+	conn, result := connector.Connect(context.Background(), mtproxyfrontend.OutboundRequest{
+		DCID:      2,
+		Transport: mtproxyfrontend.TransportAbridged,
+		RelayInit: relayInit,
+	})
+	if result.Err != nil {
+		t.Fatalf("connect: %v", result.Err)
+	}
+	defer conn.Close()
+
+	if !containsAll(dialPath, "/apiws?", "dc=2", "dst=149.154.167.220", "media=0", "sid=") {
+		t.Fatalf("path=%s", dialPath)
+	}
+	if len(socket.sent) != 1 || !bytes.Equal(socket.sent[0], relayInit) {
+		t.Fatal("FLOWSEAL_DC_MAP must keep relay init metadata when effective dc/media are unchanged")
+	}
+}
+
+func TestMtProtoWorkerConnectorMediaDestinationOverridePreservesRelayInit(t *testing.T) {
+	withRuntimeSettings(t, func(settings runtimeSettings) runtimeSettings {
+		settings.Worker.Enabled = true
+		settings.Worker.Domain = "example.workers.dev"
+		settings.Worker.Failover = workerFailoverSettings{}
+		settings.Worker.DestinationMode = tgwsroute.WorkerDestinationExperimentalForceMediaDC4
+		settings.Worker.MediaFix = flowsealMediaFixConfig{
+			Enabled: true,
+			DC:      4,
+			IP:      "149.154.167.220",
+		}
+		return settings
+	})
+
+	socket := &fakeMtProtoFrameSocket{}
+	var dialPath string
+	connector := &mtProtoWorkerConnector{
+		dial: func(_, path, _ string) (mtProtoFrameSocket, error) {
+			dialPath = path
+			return socket, nil
+		},
+	}
+	relayInit := buildTestInitWithSignedDC(t, -2)
+	conn, result := connector.Connect(context.Background(), mtproxyfrontend.OutboundRequest{
+		DCID:      2,
+		IsMedia:   true,
+		Transport: mtproxyfrontend.TransportAbridged,
+		RelayInit: relayInit,
+	})
+	if result.Err != nil {
+		t.Fatalf("connect: %v", result.Err)
+	}
+	defer conn.Close()
+
+	if !containsAll(dialPath, "/apiws?", "dc=2", "dst=149.154.167.220", "media=1", "sid=") {
+		t.Fatalf("path=%s", dialPath)
+	}
+	if len(socket.sent) != 1 {
+		t.Fatalf("sent frames=%d", len(socket.sent))
+	}
+	if !bytes.Equal(socket.sent[0], relayInit) {
+		t.Fatal("media destination override must preserve the original DC2 media relay init")
+	}
+	dc, isMedia, ok := dcFromInit(socket.sent[0])
+	if !ok || dc != 2 || !isMedia {
+		t.Fatalf("relay init dc=%d media=%t ok=%t", dc, isMedia, ok)
+	}
+}
+
 func TestMtProtoWorkerConnectorUsesPreconnectedWorkerWhenMtProtoEnabled(t *testing.T) {
 	withPoolSize(t, 1)
 	withRuntimeSettings(t, func(settings runtimeSettings) runtimeSettings {
@@ -70,6 +159,7 @@ func TestMtProtoWorkerConnectorUsesPreconnectedWorkerWhenMtProtoEnabled(t *testi
 	pool := newWorkerWsPool(&fakeWorkerDialer{})
 	workerPool = pool
 	t.Cleanup(func() {
+		waitWorkerPoolRefills(t, workerPool)
 		workerPool.CloseAll()
 		workerPool = previousPool
 	})
@@ -104,6 +194,64 @@ func TestMtProtoWorkerConnectorUsesPreconnectedWorkerWhenMtProtoEnabled(t *testi
 	}
 	if stats.workerWsPreconnectHits.Load() == 0 {
 		t.Fatal("expected worker ws preconnect hit")
+	}
+}
+
+func TestMtProtoWorkerConnectorMediaPoolMissUsesFreshDial(t *testing.T) {
+	withPoolSize(t, 1)
+	stats.Reset()
+	withRuntimeSettings(t, func(settings runtimeSettings) runtimeSettings {
+		settings.Worker.Enabled = true
+		settings.Worker.Domain = "example.workers.dev"
+		settings.Worker.Failover = workerFailoverSettings{}
+		settings.Worker.DestinationMode = tgwsroute.WorkerDestinationPreserveOriginalDst
+		settings.MtProtoWorkerPreconnect = true
+		return settings
+	})
+
+	previousPool := workerPool
+	backgroundDialer := &fakeWorkerDialer{}
+	workerPool = newWorkerWsPool(backgroundDialer)
+	t.Cleanup(func() {
+		waitWorkerPoolRefills(t, workerPool)
+		workerPool.CloseAll()
+		workerPool = previousPool
+	})
+
+	socket := &fakeMtProtoFrameSocket{}
+	foregroundDials := 0
+	var dialPath string
+	connector := &mtProtoWorkerConnector{
+		dial: func(_, path, _ string) (mtProtoFrameSocket, error) {
+			foregroundDials++
+			dialPath = path
+			return socket, nil
+		},
+	}
+
+	conn, result := connector.Connect(context.Background(), mtproxyfrontend.OutboundRequest{
+		DCID:      2,
+		IsMedia:   true,
+		Transport: mtproxyfrontend.TransportAbridged,
+		RelayInit: buildTestInitWithSignedDC(t, -2),
+	})
+	if result.Err != nil {
+		t.Fatalf("connect: %v", result.Err)
+	}
+	defer conn.Close()
+
+	if foregroundDials != 1 {
+		t.Fatalf("foreground dials=%d want=1", foregroundDials)
+	}
+	if !containsAll(dialPath, "/apiws?", "dc=2", "dst=149.154.167.51", "media=1", "sid=") {
+		t.Fatalf("path=%s", dialPath)
+	}
+	if got := stats.workerWsPreconnectMisses.Load(); got != 1 {
+		t.Fatalf("preconnect misses=%d want=1", got)
+	}
+	time.Sleep(30 * time.Millisecond)
+	if got := backgroundDialer.count.Load(); got != 0 {
+		t.Fatalf("session miss started %d duplicate background dial(s)", got)
 	}
 }
 
@@ -293,6 +441,207 @@ func TestMtProtoWebSocketStreamFramesCompletePackets(t *testing.T) {
 	}
 }
 
+
+func TestMtProtoWorkerWebSocketConnForwardsMultiplePacketsWithoutSplitting(t *testing.T) {
+	relayInit := buildTestInitWithSignedDC(t, 2)
+	socket := &fakeMtProtoFrameSocket{}
+	conn, err := mtProtoWorkerWebSocketConn(socket, relayInit, "worker.example")
+	if err != nil {
+		t.Fatalf("mtProtoWorkerWebSocketConn: %v", err)
+	}
+	defer conn.Close()
+
+	plain := append(
+		[]byte{1, 1, 2, 3, 4},
+		[]byte{1, 5, 6, 7, 8}...,
+	)
+	cipherPayload := encryptRelayPayloadForFramingTest(t, relayInit, plain)
+
+	n, err := conn.Write(cipherPayload)
+	if err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if n != len(cipherPayload) {
+		t.Fatalf("n=%d want=%d", n, len(cipherPayload))
+	}
+	if len(socket.sent) != 2 {
+		t.Fatalf("Send calls=%d want=2 (relay_init + raw payload)", len(socket.sent))
+	}
+	if !bytes.Equal(socket.sent[0], relayInit) {
+		t.Fatal("first Worker frame must be relay_init")
+	}
+	if !bytes.Equal(socket.sent[1], cipherPayload) {
+		t.Fatalf("Worker payload changed: got=%x want=%x", socket.sent[1], cipherPayload)
+	}
+	if len(socket.batches) != 0 {
+		t.Fatalf("Worker must not use packet-aware SendBatch, batches=%d", len(socket.batches))
+	}
+}
+
+func TestMtProtoWorkerWebSocketConnForwardsSplitTCPWritesImmediately(t *testing.T) {
+	relayInit := buildTestInitWithSignedDC(t, -2)
+	socket := &fakeMtProtoFrameSocket{}
+	conn, err := mtProtoWorkerWebSocketConn(socket, relayInit, "worker.example")
+	if err != nil {
+		t.Fatalf("mtProtoWorkerWebSocketConn: %v", err)
+	}
+	defer conn.Close()
+
+	plainPacket := []byte{1, 9, 8, 7, 6}
+	cipherPacket := encryptRelayPayloadForFramingTest(t, relayInit, plainPacket)
+	cut := 2
+
+	if n, err := conn.Write(cipherPacket[:cut]); err != nil || n != cut {
+		t.Fatalf("first write n=%d err=%v", n, err)
+	}
+	if len(socket.sent) != 2 || !bytes.Equal(socket.sent[1], cipherPacket[:cut]) {
+		t.Fatalf("first partial write was buffered or changed: sent=%x", socket.sent)
+	}
+
+	if n, err := conn.Write(cipherPacket[cut:]); err != nil || n != len(cipherPacket)-cut {
+		t.Fatalf("second write n=%d err=%v", n, err)
+	}
+	if len(socket.sent) != 3 || !bytes.Equal(socket.sent[2], cipherPacket[cut:]) {
+		t.Fatalf("second partial write was buffered or changed: sent=%x", socket.sent)
+	}
+	if len(socket.batches) != 0 {
+		t.Fatalf("Worker fragmented TCP writes must remain raw WS messages, batches=%d", len(socket.batches))
+	}
+}
+
+func TestMtProtoWorkerWebSocketConnForwardsLargeSequentialPayload(t *testing.T) {
+	relayInit := buildTestInitWithSignedDC(t, 2)
+	socket := &fakeMtProtoFrameSocket{}
+	conn, err := mtProtoWorkerWebSocketConn(socket, relayInit, "worker.example")
+	if err != nil {
+		t.Fatalf("mtProtoWorkerWebSocketConn: %v", err)
+	}
+	defer conn.Close()
+
+	chunks := [][]byte{
+		bytes.Repeat([]byte{0x31}, 64*1024),
+		bytes.Repeat([]byte{0x72}, 64*1024),
+		bytes.Repeat([]byte{0xA5}, 17*1024),
+	}
+	for i, chunk := range chunks {
+		n, writeErr := conn.Write(chunk)
+		if writeErr != nil {
+			t.Fatalf("write[%d]: %v", i, writeErr)
+		}
+		if n != len(chunk) {
+			t.Fatalf("write[%d] n=%d want=%d", i, n, len(chunk))
+		}
+	}
+
+	if len(socket.sent) != 1+len(chunks) {
+		t.Fatalf("Send calls=%d want=%d", len(socket.sent), 1+len(chunks))
+	}
+	for i, chunk := range chunks {
+		if len(socket.sent[i+1]) == 0 || !bytes.Equal(socket.sent[i+1], chunk) {
+			t.Fatalf("chunk[%d] corrupted or empty", i)
+		}
+	}
+	if len(socket.batches) != 0 {
+		t.Fatalf("large Worker stream must not use SendBatch, batches=%d", len(socket.batches))
+	}
+}
+
+func TestMtProtoWebSocketConnKeepsPacketSplitterForNonWorkerRoutes(t *testing.T) {
+	relayInit := buildTestInitWithSignedDC(t, 2)
+	socket := &fakeMtProtoFrameSocket{}
+	conn, err := mtProtoWebSocketConn(socket, relayInit, "cfproxy.example")
+	if err != nil {
+		t.Fatalf("mtProtoWebSocketConn: %v", err)
+	}
+	defer conn.Close()
+
+	plainPacket := []byte{1, 1, 2, 3, 4}
+	cipherPacket := encryptRelayPayloadForFramingTest(t, relayInit, plainPacket)
+	cut := 2
+
+	if n, err := conn.Write(cipherPacket[:cut]); err != nil || n != cut {
+		t.Fatalf("first write n=%d err=%v", n, err)
+	}
+	if len(socket.batches) != 0 {
+		t.Fatal("non-Worker splitter must buffer an incomplete MTProto packet")
+	}
+	if len(socket.sent) != 1 {
+		t.Fatalf("unexpected direct Send calls=%d", len(socket.sent))
+	}
+
+	if n, err := conn.Write(cipherPacket[cut:]); err != nil || n != len(cipherPacket)-cut {
+		t.Fatalf("second write n=%d err=%v", n, err)
+	}
+	if len(socket.batches) != 1 ||
+		len(socket.batches[0]) != 1 ||
+		!bytes.Equal(socket.batches[0][0], cipherPacket) {
+		t.Fatalf("non-Worker framing changed: batches=%x", socket.batches)
+	}
+}
+
+func TestMtProtoWorkerConnectorUsesRawFramingForNormalAndMedia(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		isMedia  bool
+		signedDC int16
+	}{
+		{name: "normal", isMedia: false, signedDC: 2},
+		{name: "media", isMedia: true, signedDC: -2},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			withRuntimeSettings(t, func(settings runtimeSettings) runtimeSettings {
+				settings.Worker.Enabled = true
+				settings.Worker.Domain = "example.workers.dev"
+				settings.Worker.Failover = workerFailoverSettings{}
+				settings.Worker.DestinationMode = tgwsroute.WorkerDestinationPreserveOriginalDst
+				settings.MtProtoWorkerPreconnect = false
+				return settings
+			})
+
+			socket := &fakeMtProtoFrameSocket{}
+			connector := &mtProtoWorkerConnector{
+				dial: func(_, _, _ string) (mtProtoFrameSocket, error) {
+					return socket, nil
+				},
+			}
+			relayInit := buildTestInitWithSignedDC(t, tc.signedDC)
+			conn, result := connector.Connect(context.Background(), mtproxyfrontend.OutboundRequest{
+				DCID:      2,
+				IsMedia:   tc.isMedia,
+				Transport: mtproxyfrontend.TransportAbridged,
+				RelayInit: relayInit,
+			})
+			if result.Err != nil {
+				t.Fatalf("connect: %v", result.Err)
+			}
+			defer conn.Close()
+
+			payload := []byte{0x10, 0x20, 0x30, 0x40}
+			if _, err := conn.Write(payload); err != nil {
+				t.Fatalf("write: %v", err)
+			}
+			if len(socket.sent) != 2 || !bytes.Equal(socket.sent[1], payload) {
+				t.Fatalf("Worker raw framing missing for media=%t: sent=%x", tc.isMedia, socket.sent)
+			}
+			if len(socket.batches) != 0 {
+				t.Fatalf("Worker used packet splitter for media=%t", tc.isMedia)
+			}
+		})
+	}
+}
+
+func encryptRelayPayloadForFramingTest(t *testing.T, relayInit, plain []byte) []byte {
+	t.Helper()
+	encryptor, err := newAESCTR(relayInit[8:40], relayInit[40:56])
+	if err != nil {
+		t.Fatalf("newAESCTR: %v", err)
+	}
+	encryptor.XORKeyStream(make([]byte, 64), make([]byte, 64))
+	cipherPayload := make([]byte, len(plain))
+	encryptor.XORKeyStream(cipherPayload, plain)
+	return cipherPayload
+}
+
 type fakeMtProtoFrameSocket struct {
 	sent    [][]byte
 	batches [][][]byte
@@ -369,5 +718,18 @@ func withRuntimeSettings(t *testing.T, mutate func(runtimeSettings) runtimeSetti
 	setRuntimeSettings(mutate(previous))
 	t.Cleanup(func() {
 		setRuntimeSettings(previous)
+	})
+}
+
+func withMtProtoWorkerDCMap(t *testing.T, value map[int]string) {
+	t.Helper()
+	dcOptMu.Lock()
+	previous := dcOpt
+	dcOpt = value
+	dcOptMu.Unlock()
+	t.Cleanup(func() {
+		dcOptMu.Lock()
+		dcOpt = previous
+		dcOptMu.Unlock()
 	})
 }
