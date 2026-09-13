@@ -95,3 +95,45 @@ func TestChunkRelayWriteDoesNotHedgeFastUpload(t *testing.T) {
 		t.Fatalf("calls=%d want=1", calls)
 	}
 }
+
+func TestChunkRelayBadHTTPStatusCannotWinHedge(t *testing.T) {
+	var mu sync.Mutex
+	calls := 0
+
+	conn := newTestChunkRelayConn(t, func(_ context.Context, action string, query url.Values, _ []byte) (int, http.Header, []byte, error) {
+		if action != "up" {
+			t.Fatalf("action=%s", action)
+		}
+		seq, err := strconv.ParseInt(query.Get("seq"), 10, 64)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		mu.Lock()
+		calls++
+		call := calls
+		mu.Unlock()
+
+		headers := make(http.Header)
+		if call == 1 {
+			headers.Set(chunkRelayErrorHeader, "transient_worker_error")
+			return http.StatusBadGateway, headers, nil, nil
+		}
+		headers.Set("X-Tgws-Chunk-Ack", strconv.FormatInt(seq, 10))
+		return http.StatusNoContent, headers, nil, nil
+	})
+
+	n, err := conn.Write([]byte("status-aware"))
+	if err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	if n != len("status-aware") {
+		t.Fatalf("n=%d want=%d", n, len("status-aware"))
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if calls != 2 {
+		t.Fatalf("calls=%d want=2", calls)
+	}
+}
