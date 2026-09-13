@@ -2,7 +2,9 @@ import baseWorker from "./worker.js";
 import { connect } from "cloudflare:sockets";
 import { DurableObject } from "cloudflare:workers";
 
-const REVISION = "chunk-relay-mtproto-v7";
+const REVISION = "chunk-relay-mtproto-v8";
+const HUB_REVISION = "relay-hub-v1";
+const RELAY_HUB_NAME = "relay-hub-v1";
 const RELAY_MAX_UPLOAD_CHUNK_BYTES = 12 * 1024;
 const RELAY_MAX_DOWN_CHUNK_BYTES = 8 * 1024;
 const DIAG_MAX_CHUNK_BYTES = 12 * 1024;
@@ -11,11 +13,17 @@ const MAX_POLL_WAIT_MS = 6000;
 const MAX_UPLOAD_REORDER_WINDOW = 16;
 const WORKER_STATE_HEADER = "X-Tgws-Worker-State";
 const QUOTA_RESET_HEADER = "X-Tgws-Quota-Reset";
+const HUB_REVISION_HEADER = "X-Tgws-Relay-Hub-Revision";
 const DO_QUOTA_EXHAUSTED_STATE = "do-quota-exhausted";
 const DO_QUOTA_ERROR_FRAGMENT = "Exceeded allowed duration in Durable Objects free tier";
 
 function headers(extra = {}) {
-  return { "Cache-Control": "no-store", "X-Tgws-Chunk-Relay-Revision": REVISION, ...extra };
+  return {
+    "Cache-Control": "no-store",
+    "X-Tgws-Chunk-Relay-Revision": REVISION,
+    [HUB_REVISION_HEADER]: HUB_REVISION,
+    ...extra,
+  };
 }
 
 function randomBytes(size) {
@@ -27,6 +35,10 @@ function randomBytes(size) {
 function validTarget(value) {
   const target = (value || "").trim();
   return target.length >= 3 && target.length <= 64 && /^[0-9A-Fa-f:.]+$/.test(target);
+}
+
+function validSessionId(value) {
+  return /^[A-Za-z0-9_-]{8,128}$/.test((value || "").trim());
 }
 
 function deferred() {
@@ -69,9 +81,11 @@ function durableObjectQuotaResponse(now = new Date()) {
   });
 }
 
-export class ChunkRelaySession extends DurableObject {
-  constructor(ctx, env) {
-    super(ctx, env);
+class RelaySession {
+  constructor(sid, callbacks) {
+    this.sid = sid;
+    this.onOpened = callbacks.onOpened;
+    this.onTerminated = callbacks.onTerminated;
     this.socket = null;
     this.writer = null;
     this.reader = null;
@@ -88,6 +102,7 @@ export class ChunkRelaySession extends DurableObject {
     this.queueBytes = 0;
     this.waiters = new Set();
     this.drainWaiters = new Set();
+    this.opened = false;
     this.closed = false;
   }
 
@@ -104,6 +119,37 @@ export class ChunkRelaySession extends DurableObject {
   rejectPendingUploads(error) {
     for (const entry of this.upPending.values()) entry.done.reject(error);
     this.upPending.clear();
+  }
+
+  terminate(reason, error = new Error(reason)) {
+    if (this.closed) return false;
+    this.closed = true;
+    this.rejectPendingUploads(error);
+    this.wake();
+    this.wakeDrain();
+    this.onTerminated(this, reason);
+    return true;
+  }
+
+  summary() {
+    return {
+      target: this.target,
+      up_seq: this.upSeq,
+      up_bytes: this.upBytes,
+      down_seq: this.downSeq,
+      down_bytes: this.downBytes,
+    };
+  }
+
+  isPristine() {
+    return !this.opened
+      && !this.socket
+      && !this.openPromise
+      && !this.target
+      && this.upSeq === 0
+      && this.upPending.size === 0
+      && this.downSeq === 0
+      && this.queue.length === 0;
   }
 
   async waitForDrain(requiredBytes) {
@@ -130,13 +176,16 @@ export class ChunkRelaySession extends DurableObject {
       this.socket = socket;
       this.writer = socket.writable.getWriter();
       this.reader = socket.readable.getReader();
-      console.log("chunk relay opened", { revision: REVISION, target });
+      this.opened = true;
+      this.onOpened(this);
       this.pump().catch((error) => {
-        console.log("chunk relay pump failed", { revision: REVISION, target, error: String(error) });
-        this.closed = true;
-        this.rejectPendingUploads(error);
-        this.wake();
-        this.wakeDrain();
+        console.log("chunk relay pump failed", {
+          revision: REVISION,
+          hub_revision: HUB_REVISION,
+          target,
+          error: String(error),
+        });
+        this.terminate("pump_failed", error);
       });
     })();
 
@@ -151,10 +200,7 @@ export class ChunkRelaySession extends DurableObject {
     while (!this.closed) {
       const { value, done } = await this.reader.read();
       if (done) {
-        this.closed = true;
-        this.rejectPendingUploads(new Error("upstream_closed"));
-        this.wake();
-        this.wakeDrain();
+        this.terminate("upstream_closed", new Error("upstream_closed"));
         return;
       }
       const bytes = value instanceof Uint8Array ? value : new Uint8Array(value || 0);
@@ -190,12 +236,9 @@ export class ChunkRelaySession extends DurableObject {
       try {
         await this.writer.write(entry.data);
       } catch (error) {
-        this.closed = true;
-        entry.done.reject(error);
         this.upPending.delete(nextSeq);
-        this.rejectPendingUploads(error);
-        this.wake();
-        this.wakeDrain();
+        entry.done.reject(error);
+        this.terminate("upload_write_failed", error);
         throw error;
       }
 
@@ -206,6 +249,7 @@ export class ChunkRelaySession extends DurableObject {
       if (nextSeq <= 2 || this.upBytes % (64 * 1024) < entry.data.byteLength) {
         console.log("chunk relay up", {
           revision: REVISION,
+          hub_revision: HUB_REVISION,
           target: this.target,
           seq: nextSeq,
           bytes: entry.data.byteLength,
@@ -299,29 +343,102 @@ export class ChunkRelaySession extends DurableObject {
       }
 
       if (action === "close") {
-        this.closed = true;
-        this.rejectPendingUploads(new Error("session_closed"));
-        this.wake();
-        this.wakeDrain();
+        this.terminate("client_close", new Error("session_closed"));
         try { await this.socket?.close(); } catch {}
-        console.log("chunk relay closed", {
-          revision: REVISION,
-          target: this.target,
-          up_seq: this.upSeq,
-          up_bytes: this.upBytes,
-          down_seq: this.downSeq,
-          down_bytes: this.downBytes,
-        });
         return new Response(null, { status: 204, headers: headers() });
       }
     } catch (error) {
-      console.log("chunk relay request failed", { revision: REVISION, action, target: this.target, error: String(error) });
+      console.log("chunk relay request failed", {
+        revision: REVISION,
+        hub_revision: HUB_REVISION,
+        action,
+        target: this.target,
+        error: String(error),
+      });
       return new Response("relay failed", { status: 502, headers: headers() });
     }
 
     return new Response("not found", { status: 404, headers: headers() });
   }
 }
+
+export class ChunkRelayHub extends DurableObject {
+  constructor(ctx, env) {
+    super(ctx, env);
+    this.sessions = new Map();
+    this.openedSessions = 0;
+    this.closedSessions = 0;
+    this.reapedSessions = 0;
+  }
+
+  getOrCreateSession(sid) {
+    let session = this.sessions.get(sid);
+    if (session) return session;
+
+    session = new RelaySession(sid, {
+      onOpened: (openedSession) => this.onSessionOpened(openedSession),
+      onTerminated: (terminatedSession, reason) => this.onSessionTerminated(terminatedSession, reason),
+    });
+    this.sessions.set(sid, session);
+    return session;
+  }
+
+  onSessionOpened(session) {
+    this.openedSessions += 1;
+    console.log("chunk relay hub session opened", {
+      revision: REVISION,
+      hub_revision: HUB_REVISION,
+      active_sessions: this.sessions.size,
+      opened_sessions: this.openedSessions,
+      closed_sessions: this.closedSessions,
+      reaped_sessions: this.reapedSessions,
+      target: session.target,
+    });
+  }
+
+  onSessionTerminated(session, reason) {
+    if (this.sessions.get(session.sid) !== session) return;
+    this.sessions.delete(session.sid);
+    if (reason === "client_close") this.closedSessions += 1;
+    else this.reapedSessions += 1;
+
+    console.log("chunk relay hub session terminated", {
+      revision: REVISION,
+      hub_revision: HUB_REVISION,
+      reason,
+      active_sessions: this.sessions.size,
+      opened_sessions: this.openedSessions,
+      closed_sessions: this.closedSessions,
+      reaped_sessions: this.reapedSessions,
+      ...session.summary(),
+    });
+  }
+
+  async fetch(request) {
+    const url = new URL(request.url);
+    const sid = (url.searchParams.get("sid") || "").trim();
+    if (!validSessionId(sid)) return new Response("invalid sid", { status: 400, headers: headers() });
+
+    const action = url.pathname.split("/").filter(Boolean).at(-1) || "";
+    if (!new Set(["open", "up", "down", "close"]).has(action)) {
+      return new Response("not found", { status: 404, headers: headers() });
+    }
+
+    if (action === "close" && !this.sessions.has(sid)) {
+      return new Response(null, { status: 204, headers: headers() });
+    }
+
+    const session = this.getOrCreateSession(sid);
+    const response = await session.fetch(request);
+    if (response.status >= 400 && session.isPristine() && this.sessions.get(sid) === session) {
+      this.sessions.delete(sid);
+    }
+    return response;
+  }
+}
+
+// Keep the existing Durable Object export name so deployments do not need a class migration.
+export { ChunkRelayHub as ChunkRelaySession };
 
 export default {
   async fetch(request, env, ctx) {
@@ -331,7 +448,7 @@ export default {
       if (request.method !== "POST") return new Response("method", { status: 405, headers: headers() });
       const body = new Uint8Array(await request.arrayBuffer());
       if (!body.byteLength || body.byteLength > DIAG_MAX_CHUNK_BYTES) return new Response("bad size", { status: 413, headers: headers() });
-      return Response.json({ ok: true, bytes: body.byteLength, revision: REVISION }, { headers: headers() });
+      return Response.json({ ok: true, bytes: body.byteLength, revision: REVISION, hub_revision: HUB_REVISION }, { headers: headers() });
     }
 
     if (url.pathname === "/diag/fresh-download") {
@@ -342,12 +459,15 @@ export default {
 
     if (url.pathname.startsWith("/chunk-relay/")) {
       const sid = (url.searchParams.get("sid") || "").trim();
-      if (!/^[A-Za-z0-9_-]{8,128}$/.test(sid)) return new Response("invalid sid", { status: 400, headers: headers() });
+      if (!validSessionId(sid)) return new Response("invalid sid", { status: 400, headers: headers() });
       try {
-        return await env.CHUNK_RELAY.getByName(sid).fetch(request);
+        return await env.CHUNK_RELAY.getByName(RELAY_HUB_NAME).fetch(request);
       } catch (error) {
         if (isDurableObjectQuotaError(error)) {
-          console.log("chunk relay durable object quota exhausted", { revision: REVISION, sid });
+          console.log("chunk relay durable object quota exhausted", {
+            revision: REVISION,
+            hub_revision: HUB_REVISION,
+          });
           return durableObjectQuotaResponse();
         }
         throw error;
