@@ -14,7 +14,7 @@ import (
 )
 
 const (
-	mtProtoChunkRelayUploadBytes       = 12 * 1024
+	mtProtoChunkRelayUploadBytes        = 12 * 1024
 	mtProtoChunkRelayUpWindow           = 3
 	mtProtoChunkRelayPrimaryRequests    = 12
 	mtProtoChunkRelayGlobalHTTPRequests = 18
@@ -122,24 +122,30 @@ func (c *mtProtoChunkRelayConn) requestPipelinedUploadWithRetry(
 		parent = context.Background()
 	}
 	var lastErr error
+	var lastStatus int
+	var lastHeaders http.Header
+	var lastBody []byte
 	for attempt := 0; attempt <= mtProtoChunkRelayMaxRetries; attempt++ {
 		status, headers, responseBody, err := c.requestPipelinedUploadRound(parent, query, body, seq, head)
+		if err == nil {
+			err = chunkRelayResponseError("up", status, headers)
+		}
 		if err == nil {
 			return status, headers, responseBody, nil
 		}
 		lastErr = err
+		lastStatus = status
+		lastHeaders = headers
+		lastBody = responseBody
+		logChunkRelayResponseDecision(c, "up", "up", seq, status, err, attempt)
+		if _, circuitOpen := workerCircuitError(err); circuitOpen {
+			return status, headers, responseBody, err
+		}
+		if !chunkRelayErrorRetryable(err) {
+			return status, headers, responseBody, err
+		}
 		if attempt >= mtProtoChunkRelayMaxRetries {
 			break
-		}
-		if logInfo != nil {
-			logInfo.Printf(
-				"MTProto Worker chunk relay retry session_id=%s direction=up seq=%d attempt=%d/%d error=%s",
-				c.sessionID,
-				seq,
-				attempt+1,
-				mtProtoChunkRelayMaxRetries,
-				mtProtoStatusField(err.Error()),
-			)
 		}
 		backoff := 300 * time.Millisecond * time.Duration(1<<attempt)
 		timer := time.NewTimer(backoff)
@@ -153,7 +159,7 @@ func (c *mtProtoChunkRelayConn) requestPipelinedUploadWithRetry(
 		case <-timer.C:
 		}
 	}
-	return 0, nil, nil, lastErr
+	return lastStatus, lastHeaders, lastBody, lastErr
 }
 
 func (c *mtProtoChunkRelayConn) requestPipelinedUploadRound(
@@ -189,7 +195,7 @@ func (c *mtProtoChunkRelayConn) requestPipelinedUploadRound(
 	hedgeLaunched := false
 	delayElapsed := false
 	completed := 0
-	var lastErr error
+	var lastResult chunkRelayAttemptResult
 
 	launchHedge := func(reason string) {
 		if hedgeLaunched {
@@ -225,6 +231,9 @@ func (c *mtProtoChunkRelayConn) requestPipelinedUploadRound(
 		case result := <-results:
 			completed++
 			if result.err == nil {
+				result.err = chunkRelayResponseError("up", result.status, result.headers)
+			}
+			if result.err == nil {
 				roundCancel()
 				if result.leg == "hedge" && logInfo != nil {
 					logInfo.Printf(
@@ -235,17 +244,25 @@ func (c *mtProtoChunkRelayConn) requestPipelinedUploadRound(
 				}
 				return result.status, result.headers, result.responseBody, nil
 			}
-			lastErr = result.err
+			lastResult = result
+			if _, circuitOpen := workerCircuitError(result.err); circuitOpen {
+				roundCancel()
+				return result.status, result.headers, result.responseBody, result.err
+			}
+			if !chunkRelayErrorRetryable(result.err) {
+				roundCancel()
+				return result.status, result.headers, result.responseBody, result.err
+			}
 			if !hedgeLaunched {
 				isHead, alreadyDone, _ := head.state(seq)
 				if isHead && !alreadyDone {
 					launchHedge("primary_error_head")
 				} else {
-					return 0, nil, nil, lastErr
+					return result.status, result.headers, result.responseBody, result.err
 				}
 			}
 			if hedgeLaunched && completed >= 2 {
-				return 0, nil, nil, lastErr
+				return lastResult.status, lastResult.headers, lastResult.responseBody, lastResult.err
 			}
 		case <-timer.C:
 			delayElapsed = true
@@ -335,6 +352,9 @@ func writePipelinedMtProtoChunkRelay(c *mtProtoChunkRelayConn, data []byte) (int
 
 		if result.err != nil {
 			pipelineCancel()
+			if chunkRelayTerminalSessionError(result.err) {
+				return written, io.EOF
+			}
 			return written, result.err
 		}
 		if result.status == http.StatusGone {

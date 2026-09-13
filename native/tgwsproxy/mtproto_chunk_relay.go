@@ -26,9 +26,9 @@ const (
 	mtProtoChunkRelayDownTimeout  = 10 * time.Second
 	mtProtoChunkRelayPollWaitMS   = 6000
 
-	chunkRelayWorkerStateHeader      = "X-Tgws-Worker-State"
-	chunkRelayQuotaResetHeader       = "X-Tgws-Quota-Reset"
-	chunkRelayQuotaExhaustedState    = "do-quota-exhausted"
+	chunkRelayWorkerStateHeader   = "X-Tgws-Worker-State"
+	chunkRelayQuotaResetHeader    = "X-Tgws-Quota-Reset"
+	chunkRelayQuotaExhaustedState = "do-quota-exhausted"
 )
 
 // Each relay request still uses a fresh TCP/TLS connection. Sharing only the
@@ -134,6 +134,17 @@ func dialMtProtoChunkRelay(
 	status, headers, _, err := conn.requestWithRetry(ctx, "open", openQuery, nil, "open", 0)
 	if err != nil {
 		cancel()
+		if _, circuitOpen := workerCircuitError(err); !circuitOpen {
+			if responseStatus, _, ok := chunkRelayHTTPErrorDetails(err); ok && responseStatus >= 500 {
+				until := markWorkerTemporaryFailure(domain, time.Now())
+				return nil, fmt.Errorf("open chunk relay: %w", &workerCircuitOpenError{
+					Domain: domain,
+					Reason: workerCircuitReasonTemporaryFailed,
+					Until:  until,
+					Status: responseStatus,
+				})
+			}
+		}
 		return nil, fmt.Errorf("open chunk relay: %w", err)
 	}
 	if status != http.StatusNoContent {
@@ -235,6 +246,9 @@ func (c *mtProtoChunkRelayConn) freshHTTPRequest(
 	if circuitErr := chunkRelayCircuitErrorForResponse(c.domain, resp.StatusCode, headers, time.Now()); circuitErr != nil {
 		return resp.StatusCode, headers, responseBody, circuitErr
 	}
+	if responseErr := chunkRelayResponseError(action, resp.StatusCode, headers); responseErr != nil {
+		return resp.StatusCode, headers, responseBody, responseErr
+	}
 	return resp.StatusCode, headers, responseBody, nil
 }
 
@@ -246,7 +260,13 @@ func (c *mtProtoChunkRelayConn) requestWithRetry(
 	direction string,
 	seq int64,
 ) (int, http.Header, []byte, error) {
+	if parent == nil {
+		parent = context.Background()
+	}
 	var lastErr error
+	var lastStatus int
+	var lastHeaders http.Header
+	var lastBody []byte
 	for attempt := 0; attempt <= mtProtoChunkRelayMaxRetries; attempt++ {
 		var status int
 		var headers http.Header
@@ -258,27 +278,26 @@ func (c *mtProtoChunkRelayConn) requestWithRetry(
 			ctx, cancel := c.requestContext(parent, direction)
 			status, headers, responseBody, err = c.request(ctx, action, query, body)
 			cancel()
+			if err == nil {
+				err = chunkRelayResponseError(action, status, headers)
+			}
 		}
 		if err == nil {
 			return status, headers, responseBody, nil
 		}
+		lastErr = err
+		lastStatus = status
+		lastHeaders = headers
+		lastBody = responseBody
+		logChunkRelayResponseDecision(c, action, direction, seq, status, err, attempt)
 		if _, circuitOpen := workerCircuitError(err); circuitOpen {
 			return status, headers, responseBody, err
 		}
-		lastErr = err
+		if !chunkRelayErrorRetryable(err) {
+			return status, headers, responseBody, err
+		}
 		if attempt >= mtProtoChunkRelayMaxRetries {
 			break
-		}
-		if logInfo != nil {
-			logInfo.Printf(
-				"MTProto Worker chunk relay retry session_id=%s direction=%s seq=%d attempt=%d/%d error=%s",
-				c.sessionID,
-				direction,
-				seq,
-				attempt+1,
-				mtProtoChunkRelayMaxRetries,
-				mtProtoStatusField(err.Error()),
-			)
 		}
 		backoff := 300 * time.Millisecond * time.Duration(1<<attempt)
 		timer := time.NewTimer(backoff)
@@ -292,7 +311,7 @@ func (c *mtProtoChunkRelayConn) requestWithRetry(
 		case <-timer.C:
 		}
 	}
-	return 0, nil, nil, lastErr
+	return lastStatus, lastHeaders, lastBody, lastErr
 }
 
 type chunkRelayAttemptResult struct {
@@ -336,7 +355,7 @@ func (c *mtProtoChunkRelayConn) requestUpHedgeRound(
 	defer timer.Stop()
 	hedgeLaunched := false
 	completed := 0
-	var lastErr error
+	var lastResult chunkRelayAttemptResult
 
 	launchHedge := func(reason string) {
 		if hedgeLaunched {
@@ -360,6 +379,9 @@ func (c *mtProtoChunkRelayConn) requestUpHedgeRound(
 		case result := <-results:
 			completed++
 			if result.err == nil {
+				result.err = chunkRelayResponseError("up", result.status, result.headers)
+			}
+			if result.err == nil {
 				roundCancel()
 				if result.leg == "hedge" && logInfo != nil {
 					logInfo.Printf(
@@ -370,11 +392,15 @@ func (c *mtProtoChunkRelayConn) requestUpHedgeRound(
 				}
 				return result.status, result.headers, result.responseBody, nil
 			}
+			lastResult = result
 			if _, circuitOpen := workerCircuitError(result.err); circuitOpen {
 				roundCancel()
 				return result.status, result.headers, result.responseBody, result.err
 			}
-			lastErr = result.err
+			if !chunkRelayErrorRetryable(result.err) {
+				roundCancel()
+				return result.status, result.headers, result.responseBody, result.err
+			}
 			if !hedgeLaunched {
 				if !timer.Stop() {
 					select {
@@ -385,7 +411,7 @@ func (c *mtProtoChunkRelayConn) requestUpHedgeRound(
 				launchHedge("primary_error")
 			}
 			if hedgeLaunched && completed >= 2 {
-				return 0, nil, nil, lastErr
+				return lastResult.status, lastResult.headers, lastResult.responseBody, lastResult.err
 			}
 		case <-timer.C:
 			launchHedge("delay")
@@ -454,6 +480,9 @@ func (c *mtProtoChunkRelayConn) Write(data []byte) (int, error) {
 		}
 		status, headers, _, err := c.requestWithRetry(context.Background(), "up", query, chunk, "up", seq)
 		if err != nil {
+			if chunkRelayTerminalSessionError(err) {
+				return written, io.EOF
+			}
 			return written, err
 		}
 		if status == http.StatusGone {
@@ -508,6 +537,9 @@ func (c *mtProtoChunkRelayConn) Read(dst []byte) (int, error) {
 		}
 		status, headers, body, err := c.requestWithRetry(context.Background(), "down", query, nil, "down", c.ackSeq)
 		if err != nil {
+			if chunkRelayTerminalSessionError(err) {
+				return 0, io.EOF
+			}
 			return 0, err
 		}
 		switch status {
