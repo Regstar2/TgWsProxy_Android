@@ -28,8 +28,19 @@ func dialFlowsealWorkerCandidateContext(ctx context.Context, domain, path, logPr
 			return nil, err
 		}
 		if logInfo != nil {
-			logInfo.Printf("%s Worker transport=chunk_relay_http host=%s path=%s chunk_bytes=%d max_retries=%d",
-				logPrefix, domain, path, mtProtoChunkRelayBytes, mtProtoChunkRelayMaxRetries)
+			logInfo.Printf(
+				"%s Worker transport=chunk_relay_http host=%s path=%s upload_chunk_bytes=%d window=%d primary_requests=%d global_http_requests=%d hol_hedge_delay_ms=%d pipeline=%s max_retries=%d",
+				logPrefix,
+				domain,
+				path,
+				mtProtoChunkRelayUploadBytes,
+				mtProtoChunkRelayUpWindow,
+				mtProtoChunkRelayPrimaryRequests,
+				mtProtoChunkRelayGlobalHTTPRequests,
+				mtProtoChunkRelayHOLHedgeDelay.Milliseconds(),
+				mtProtoChunkRelayPipelineMode,
+				mtProtoChunkRelayMaxRetries,
+			)
 		}
 		return socket, nil
 	}
