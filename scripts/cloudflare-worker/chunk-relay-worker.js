@@ -77,6 +77,10 @@ function deferred() {
     resolve = res;
     reject = rej;
   });
+  // A request can fail while drainUploads() still owns admission, before the
+  // request reaches its explicit await below. Keep the rejection observable to
+  // awaiters without letting it become an unhandled rejection in that window.
+  promise.catch(() => {});
   return { promise, resolve, reject };
 }
 
