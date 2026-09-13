@@ -9,18 +9,22 @@ const source = (await readFile(new URL("./chunk-relay-worker.js", import.meta.ur
 
 const mod = await import("data:text/javascript;base64," + Buffer.from(source).toString("base64"));
 
-function makeSocket(writes) {
+function makeSocket(writes, options = {}) {
   return {
-    opened: Promise.resolve(),
+    opened: options.opened || Promise.resolve(),
     writable: {
       getWriter() {
         return {
-          async write(data) { writes.push(new Uint8Array(data).slice()); },
+          async write(data) {
+            if (options.writeError) throw options.writeError;
+            writes.push(new Uint8Array(data).slice());
+          },
         };
       },
     },
     readable: {
       getReader() {
+        if (options.read) return { read: options.read };
         return { read: () => new Promise(() => {}) };
       },
     },
@@ -59,7 +63,7 @@ test("duplicate upload sequence is written only once", async (t) => {
   assert.deepEqual([...writes[0]], [...body]);
 });
 
-test("relay binds a session to one target", async (t) => {
+test("relay classifies target mismatch as a non-retryable conflict", async (t) => {
   const writes = [];
   const oldConnect = globalThis.__chunkRelayConnect;
   globalThis.__chunkRelayConnect = () => makeSocket(writes);
@@ -76,7 +80,63 @@ test("relay binds a session to one target", async (t) => {
     "https://example.workers.dev/chunk-relay/open?sid=session_test_456&dst=149.154.167.91",
     { method: "POST" },
   ));
-  assert.equal(second.status, 502);
+  assert.equal(second.status, 409);
+  assert.equal(second.headers.get("X-Tgws-Relay-Error"), "target_mismatch");
+});
+
+test("relay reports lost sessions with HTTP 410", async () => {
+  const relay = new mod.ChunkRelaySession({}, {});
+  const response = await relay.fetch(new Request(
+    "https://example.workers.dev/chunk-relay/down?sid=session_lost_123&dst=149.154.167.51&ack=1&wait=0",
+  ));
+  assert.equal(response.status, 410);
+  assert.equal(response.headers.get("X-Tgws-Relay-Error"), "session_lost");
+});
+
+test("relay reports upstream EOF separately from generic 502", async (t) => {
+  const writes = [];
+  const oldConnect = globalThis.__chunkRelayConnect;
+  globalThis.__chunkRelayConnect = () => makeSocket(writes, {
+    read: async () => ({ value: undefined, done: true }),
+  });
+  t.after(() => { globalThis.__chunkRelayConnect = oldConnect; });
+
+  const relay = new mod.ChunkRelaySession({}, {});
+  const open = await relay.fetch(new Request(
+    "https://example.workers.dev/chunk-relay/open?sid=session_eof_123&dst=149.154.167.51",
+    { method: "POST" },
+  ));
+  assert.equal(open.status, 204);
+  await new Promise((resolve) => setImmediate(resolve));
+
+  const down = await relay.fetch(new Request(
+    "https://example.workers.dev/chunk-relay/down?sid=session_eof_123&dst=149.154.167.51&ack=0&wait=0",
+  ));
+  assert.equal(down.status, 410);
+  assert.equal(down.headers.get("X-Tgws-Relay-Error"), "upstream_closed");
+});
+
+test("relay reports socket write failure as terminal for the current session", async (t) => {
+  const writes = [];
+  const oldConnect = globalThis.__chunkRelayConnect;
+  globalThis.__chunkRelayConnect = () => makeSocket(writes, {
+    writeError: new Error("synthetic write failure"),
+  });
+  t.after(() => { globalThis.__chunkRelayConnect = oldConnect; });
+
+  const relay = new mod.ChunkRelaySession({}, {});
+  const open = await relay.fetch(new Request(
+    "https://example.workers.dev/chunk-relay/open?sid=session_write_123&dst=149.154.167.51",
+    { method: "POST" },
+  ));
+  assert.equal(open.status, 204);
+
+  const up = await relay.fetch(new Request(
+    "https://example.workers.dev/chunk-relay/up?sid=session_write_123&dst=149.154.167.51&seq=1",
+    { method: "POST", body: new Uint8Array([1, 2, 3]) },
+  ));
+  assert.equal(up.status, 410);
+  assert.equal(up.headers.get("X-Tgws-Relay-Error"), "socket_write_failed");
 });
 
 test("relay accepts 12 KiB upload chunks and rejects larger bodies", async (t) => {
@@ -106,6 +166,7 @@ test("relay accepts 12 KiB upload chunks and rejects larger bodies", async (t) =
     { method: "POST", body: new Uint8Array(12 * 1024 + 1) },
   ));
   assert.equal(tooLarge.status, 413);
+  assert.equal(tooLarge.headers.get("X-Tgws-Relay-Error"), "invalid_size");
   assert.equal(writes.length, 1);
 });
 
@@ -144,12 +205,12 @@ test("top-level worker maps Durable Object free-tier duration exhaustion to a re
 
   assert.equal(response.status, 503);
   assert.equal(response.headers.get("X-Tgws-Worker-State"), "do-quota-exhausted");
-  assert.equal(response.headers.get("X-Tgws-Chunk-Relay-Revision"), "chunk-relay-mtproto-v7");
+  assert.equal(response.headers.get("X-Tgws-Chunk-Relay-Revision"), "chunk-relay-mtproto-v8");
   assert.ok(Number.parseInt(response.headers.get("Retry-After") || "0", 10) >= 60);
   assert.ok(!Number.isNaN(Date.parse(response.headers.get("X-Tgws-Quota-Reset") || "")));
 });
 
-test("top-level worker does not hide unrelated Durable Object exceptions", async () => {
+test("top-level worker classifies unrelated Durable Object exceptions as transient", async () => {
   const env = {
     CHUNK_RELAY: {
       getByName() {
@@ -162,11 +223,12 @@ test("top-level worker does not hide unrelated Durable Object exceptions", async
     },
   };
 
-  await assert.rejects(
-    () => mod.default.fetch(new Request(
-      "https://example.workers.dev/chunk-relay/open?sid=session_error_123&dst=149.154.167.51",
-      { method: "POST" },
-    ), env, {}),
-    /unexpected durable object failure/,
-  );
+  const response = await mod.default.fetch(new Request(
+    "https://example.workers.dev/chunk-relay/open?sid=session_error_123&dst=149.154.167.51",
+    { method: "POST" },
+  ), env, {});
+
+  assert.equal(response.status, 502);
+  assert.equal(response.headers.get("X-Tgws-Relay-Error"), "transient_worker_error");
+  assert.equal(response.headers.get("X-Tgws-Chunk-Relay-Revision"), "chunk-relay-mtproto-v8");
 });
